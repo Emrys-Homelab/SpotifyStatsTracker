@@ -479,6 +479,28 @@ class SpotifyDashboardApp(ViewModelMixin, PaginationMixin, DateRangeMixin, Wrapp
             except OSError:
                 pass
 
+    def verifyCookiesForEmail(self, cookies: str, email: str):
+        """The parsed cookies, or None when they don't provably belong to `email`.
+
+        One implementation for every door that accepts Spotify cookies: the
+        three standalone forms (login/register/reset-password, through
+        routes/auth.py's _verifiedCookies) and the trusted-header
+        /connect-spotify page. They must ask the same question - the per-user
+        Listener refuses to record a session whose Spotify email differs from
+        the account's email (see spotifyListener._captureIdentityBaseline), so
+        accepting a mismatched session here would store a credential that can
+        never track.
+
+        SKIP_EMAIL_VERIFICATION remains the explicit, instance-wide opt-out of
+        the ownership check (see config.py); it is deliberately unchanged.
+        """
+        parsed = parseCookieString(cookies)
+        if (not self.skipEmailVerification
+                and self.repo.isEmailVerificationEnabled()
+                and not self._verifyCookiesMatchEmail(parsed, email)):
+            return None
+        return parsed
+
     def unauthenticatedResponse(self, nextPath: str | None = None):
         """The "no live session" response for a route. An ajax request gets a
         401 JSON body: a redirect would be followed transparently by fetch(),

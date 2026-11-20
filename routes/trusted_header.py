@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: 2026 i7Gamer
 # SPDX-License-Identifier: AGPL-3.0-or-later
 
-"""The trusted-header request path: authenticate from the proxy's assertion.
+"""The trusted-header request path: authenticate, then ask for Spotify cookies.
 
 Registered only when ``TRUSTED_HEADER_AUTH`` is on (see
 services/trusted_header.py for the settings and the peer check). What this
@@ -15,6 +15,13 @@ module adds on top of it:
 * The app's own doors close. ``/login``, ``/register`` and ``/reset-password``
   answer 404 rather than a form nobody should use; ``/logout`` becomes a
   redirect (Authelia owns the real session).
+* A first login lands on ``/connect-spotify``. Header-only identity is enough
+  to log in but NOT to track: ``is_user_logged_in()`` is False while
+  ``users.cookies_json`` is NULL, and the per-user listener that records plays
+  is built from those cookies. The cookie page is where that one remaining
+  credential is supplied, and the ownership check is the same one the
+  standalone forms use - the Spotify account's email must match the trusted
+  email, or the listener would (correctly) refuse to record as contamination.
 
 The refusal branches are deliberately NOT redirects to the login form:
 an untrusted peer, or a missing identity header, is a misconfiguration or an
@@ -23,9 +30,10 @@ operator to "just log in" past the thing that is wrong.
 """
 import logging
 
-from flask import Response, abort, redirect, request, session, url_for
+from flask import Response, abort, redirect, render_template, request, session, url_for
 
 from config import SESSION_VERSION_KEY, TRUSTED_HEADER_SESSION_KEY
+from routes.auth import COOKIE_OWNERSHIP_ERROR
 from services.trusted_header import (
     identityFromHeaders,
     isTrustedPeer,
@@ -125,4 +133,59 @@ def register(app, dashboard) -> None:
                         username, identity.user)
 
         _establishSession(dashboard, identity.email, username)
+
+        # Identity is settled; the Spotify credential may not be. The test is
+        # the app's own notion of a usable session - stored cookies AND a
+        # listener that authenticated with them - not merely a non-NULL
+        # cookies_json column. An expired or rejected session must land on the
+        # cookie page too: get_user_db() re-raises a listener construction
+        # failure, and without this check the dashboard answers 500 instead of
+        # offering the one action that fixes it. /connect-spotify is the page
+        # allowed through without a session; a non-GET is refused rather than
+        # redirected, because a form post followed by a 302 is a silent loss.
+        if (request.endpoint != "connectSpotify"
+                and not dashboard.is_user_logged_in(identity.email)):
+            if request.method in ("GET", "HEAD"):
+                return redirect(url_for("connectSpotify"))
+            return _forbidden("no usable Spotify session is connected to this account")
+
         return None
+
+    @app.route("/connect-spotify", methods=["GET", "POST"])
+    def connectSpotify():
+        """Supply the one credential the SSO proxy cannot: a Spotify session."""
+        email = session.get("email")
+        if not email or session.get(TRUSTED_HEADER_SESSION_KEY) is not True:
+            abort(403)
+        username = dashboard.get_username_for_email(email)
+        if not username:
+            abort(403)
+
+        error = None
+        if request.method == "POST":
+            cookies = request.form.get("cookies", "").strip()
+            if not cookies:
+                error = "Paste the cookies from your Spotify session."
+            else:
+                parsed = dashboard.verifyCookiesForEmail(cookies, email)
+                if parsed is None:
+                    error = COOKIE_OWNERSHIP_ERROR.format(email=email)
+                else:
+                    dashboard.repo.setUserCookies(username, parsed)
+                    # A user who re-connects after an expiry already has a
+                    # Database (and a dead listener); a first login does not.
+                    # Both paths must leave a listener built from the NEW
+                    # cookies and no stale login-status cache.
+                    dashboard._invalidateLoginCache(email)
+                    if username in dashboard.user_databases:
+                        dashboard._refresh_user_session(username, email)
+                    else:
+                        dashboard.get_user_db(username, email)
+                    return redirect(url_for("dashboard"))
+
+        return render_template(
+            "connect_spotify.html",
+            email=email,
+            error=error,
+            has_cookies=dashboard.repo.getUserCookies(username) is not None,
+        )

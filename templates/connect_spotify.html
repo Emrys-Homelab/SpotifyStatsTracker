@@ -1,0 +1,55 @@
+{#- SPDX-FileCopyrightText: 2026 i7Gamer
+    SPDX-License-Identifier: AGPL-3.0-or-later
+
+    The trusted-header first-login page. It is the destination when the proxy
+    has already proved who the user is but this account has no Spotify session
+    stored yet - see routes/trusted_header.py. Deliberately the public layout:
+    there is no account chrome worth showing before the account has a data
+    source, and it keeps this page one form.
+-#}
+{% extends "layout_public.html" %}
+{% block title %}Connect Spotify - {{ super() }}{% endblock %}
+{% block content %}
+
+<div class="login-panel">
+  <div class="login-card">
+    <h1>Connect Spotify</h1>
+    <p>
+      You are signed in as <strong>{{ email }}</strong> through your identity provider.
+      This app reads your listening history from a Spotify web session, so it needs
+      that one credential before it can track anything.
+    </p>
+
+    {% if has_cookies %}
+      <p>
+        A Spotify session is already stored. Pasting a new one replaces it - use this
+        after the saved session expires or if tracking has stopped.
+      </p>
+    {% endif %}
+
+    {% if error %}
+      <p class="error">{{ error }}</p>
+    {% endif %}
+
+    <form class="login-form" method="post" action="{{ url_for('connectSpotify') }}">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token() }}"/>
+
+      <div class="form-group">
+        <label for="connectCookies">Cookies</label>
+        <textarea id="connectCookies" name="cookies" autofocus required></textarea>
+      </div>
+
+      <button type="submit" class="primary-button">Save Spotify Session</button>
+    </form>
+
+    {% include "_cookie_instructions.html" %}
+
+    <p>
+      The Spotify account's email must match <strong>{{ email }}</strong>. The
+      tracker records under the identity your proxy authenticated, and a session
+      for a different Spotify account is refused rather than mixed into it.
+    </p>
+  </div>
+</div>
+
+{% endblock %}

@@ -150,17 +150,31 @@ class TrustedHeaderRequestTestCase(unittest.TestCase):
             path, headers=headers or {}, environ_base={"REMOTE_ADDR": peer},
             **kwargs)
 
-    def test_first_header_login_creates_the_account(self):
+    def test_first_header_login_creates_the_account_and_redirects_to_cookies(self):
         dash = self._makeApp()
-        # A path with no view: the request only has to pass the before_request
-        # hook for the account to be created, and 404 keeps this test out of a
-        # dashboard render that would start a real per-user Database.
-        response = self._get(dash, path="/no-such-page",
-                             headers={"Remote-User": "myrddin"})
+        with patch.object(dash, "is_user_logged_in", return_value=False):
+            response = self._get(dash, headers={"Remote-User": "myrddin"})
 
-        self.assertEqual(response.status_code, 404)
+        self.assertEqual(response.status_code, 302)
+        self.assertIn("/connect-spotify", response.headers["Location"])
         self.assertEqual(dash.repo.getUsernameForEmail(
             f"myrddin@{SYNTHETIC_EMAIL_DOMAIN}"), "myrddin")
+
+    def test_a_stored_but_dead_spotify_session_lands_on_the_cookie_page(self):
+        """Not a 500: get_user_db() re-raises a listener construction failure.
+
+        The live bug this covers: a dummy/expired cookie made
+        startRecentlyPlayedListener raise WebSocketError, and the dashboard
+        answered 500 because only the cookies_json column was checked.
+        """
+        dash = self._makeApp()
+        dash.repo.upsertUser("myrddin", f"myrddin@{SYNTHETIC_EMAIL_DOMAIN}")
+        dash.repo.setUserCookies("myrddin", {"sp_dc": "expired"})
+        with patch.object(dash, "is_user_logged_in", return_value=False):
+            response = self._get(dash, headers={"Remote-User": "myrddin"})
+
+        self.assertEqual(response.status_code, 302)
+        self.assertIn("/connect-spotify", response.headers["Location"])
 
     def test_a_request_without_the_header_is_refused(self):
         dash = self._makeApp()
@@ -198,11 +212,13 @@ class TrustedHeaderRequestTestCase(unittest.TestCase):
 
     def test_a_trusted_peer_is_still_trusted_when_xff_names_someone_else(self):
         dash = self._makeApp(env={"TRUST_PROXY_HEADERS": "1"})
+        # /connect-spotify is the one page that does not require a live Spotify
+        # session, so this exercises the peer check without starting a listener.
         response = self._get(
-            dash, path="/no-such-page",
+            dash, path="/connect-spotify",
             headers={"Remote-User": "myrddin",
                      "X-Forwarded-For": "203.0.113.9"})
-        self.assertEqual(response.status_code, 404)
+        self.assertEqual(response.status_code, 200)
         self.assertEqual(dash.repo.getUsernameForEmail(
             f"myrddin@{SYNTHETIC_EMAIL_DOMAIN}"), "myrddin")
 
@@ -222,6 +238,44 @@ class TrustedHeaderRequestTestCase(unittest.TestCase):
         # /health has no identity header and its peer is the node, not the proxy.
         health = self._get(dash, path="/health", peer=OTHER_PEER)
         self.assertEqual(health.status_code, 200)
+
+    def test_the_cookie_page_renders_the_instructions(self):
+        dash = self._makeApp()
+        response = self._get(dash, path="/connect-spotify",
+                             headers={"Remote-User": "myrddin"})
+
+        self.assertEqual(response.status_code, 200)
+        body = response.get_data(as_text=True)
+        self.assertIn("Connect Spotify", body)
+        self.assertIn("How to locate your session data", body)
+
+    def test_the_cookie_page_rejects_cookies_that_are_not_this_accounts(self):
+        dash = self._makeApp()
+        client = dash.app.test_client()
+        with patch.object(dash, "verifyCookiesForEmail", return_value=None):
+            response = client.post(
+                "/connect-spotify", data={"cookies": "sp_dc=someone-else"},
+                headers={"Remote-User": "myrddin"},
+                environ_base={"REMOTE_ADDR": PROXY_PEER})
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("Couldn&#39;t verify", response.get_data(as_text=True))
+
+    def test_the_cookie_page_saves_a_verified_session_and_returns_to_the_app(self):
+        dash = self._makeApp()
+        client = dash.app.test_client()
+        saved = MagicMock()
+        with patch.object(dash, "verifyCookiesForEmail", return_value={"sp_dc": "ok"}), \
+             patch.object(dash, "get_user_db", return_value=saved), \
+             patch.object(dash, "is_user_logged_in", return_value=False):
+            response = client.post(
+                "/connect-spotify", data={"cookies": "sp_dc=ok"},
+                headers={"Remote-User": "myrddin"},
+                environ_base={"REMOTE_ADDR": PROXY_PEER})
+
+        self.assertEqual(response.status_code, 302)
+        self.assertTrue(response.headers["Location"].endswith("/"))
+        self.assertEqual(dash.repo.getUserCookies("myrddin"), {"sp_dc": "ok"})
 
     def test_a_header_session_survives_a_dead_spotify_listener(self):
         """Authentication is the proxy's; a dead listener is not a logout.

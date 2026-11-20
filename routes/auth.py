@@ -27,7 +27,6 @@ from config import (
     SPOTIFY_AUTH_TIMEOUT_SECONDS, SPOTIFY_CALLBACK_URL_ENV_VAR,
 )
 from dashboard.date_ranges import SETTABLE_INTERVALS
-from Database.Spotify.cookies import parseCookieString
 from Database.utils import parseError, truncateForLog
 from Database.lastfm import LastfmClient
 from services.email_worker import queue_email_notification
@@ -134,17 +133,15 @@ def register(app, dashboard):
         down to a character-identical error string. Three copies of one rule is
         how one of them drifts.
 
-        Verification runs against a THROWAWAY session file (see
-        _verifyCookiesMatchEmail), so nothing is persisted for an email until
-        the cookies are shown to be that account's. None rather than {} for the
-        rejection: every caller has already refused an empty submission, so the
-        two can't be confused."""
-        parsed = parseCookieString(cookies)
-        if (not dashboard.skipEmailVerification
-                and dashboard.repo.isEmailVerificationEnabled()
-                and not dashboard._verifyCookiesMatchEmail(parsed, email)):
-            return None
-        return parsed
+        The rule itself lives on the dashboard (verifyCookiesForEmail), because
+        the trusted-header /connect-spotify page is a fourth door that must ask
+        the identical question: the per-user Listener refuses to record a
+        Spotify session whose email differs from the account's. Verification
+        runs against a THROWAWAY session file (see _verifyCookiesMatchEmail), so
+        nothing is persisted for an email until the cookies are shown to be that
+        account's. None rather than {} for the rejection: every caller has
+        already refused an empty submission, so the two can't be confused."""
+        return dashboard.verifyCookiesForEmail(cookies, email)
 
     def _safeNextUrl(nextUrl):
         """Only allow same-origin relative redirects after login - a `next`
