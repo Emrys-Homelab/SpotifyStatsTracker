@@ -64,6 +64,7 @@ ENV_VAR_NAMES_WITH_CONSTANTS = frozenset({
     "SPOTIFY_TOTP_SECRET", "SPOTIFY_TOTP_AUTO_RECOVER",
     "DATA_ENCRYPTION_KEY", "FLASK_SECRET_KEY",
     "SPOTIFY_CALLBACK_URL", "SKIP_EMAIL_VERIFICATION", "IMPORT_KEYWORD",
+    "TRUSTED_HEADER_AUTH", "TRUSTED_PROXY_CIDRS",
 })
 # Read by the app without a *_ENV_VAR constant: FLASK_DEBUG through its one
 # reader (the gate above), WAITRESS_THREADS by wsgi.py at the last moment

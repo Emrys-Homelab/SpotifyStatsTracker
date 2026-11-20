@@ -106,6 +106,8 @@ Every variable below is optional unless marked otherwise, and every one is prese
 | `ADMIN_EMAIL` | earliest-registered user | Makes this account the instance's only admin (`/admin`). |
 | `SPOTIFY_CALLBACK_URL` | unset | Your public callback URL. Enables [Spotify Web API backfilling](#spotify-web-api-backfilling). |
 | `TRUST_PROXY_HEADERS` | `0` | Number of proxy hops, so rate limiting sees real client IPs. Only set this when a proxy really is in front — otherwise clients can forge their IP. |
+| `TRUSTED_HEADER_AUTH` | `0` | Accept `Remote-User`/`Remote-Email` from a forward-auth proxy as the logged-in account, instead of this app's login form. Requires `TRUSTED_PROXY_CIDRS`; the app refuses to start without it. See [Trusted-header SSO](docs/trusted-header-auth.md). |
+| `TRUSTED_PROXY_CIDRS` | unset | Comma-separated CIDRs of the proxy's source addresses; required with `TRUSTED_HEADER_AUTH`. The header is believed only when the TCP peer is inside one of them. |
 | `ENABLE_HSTS` | `0` | Sends `Strict-Transport-Security`. Only behind TLS termination; on plain HTTP it locks browsers out. |
 | `IMPORT_KEYWORD` | unset | Auto-import only files whose name contains this keyword. |
 | `WAITRESS_THREADS` | `16` | Request-handling threads. Worth raising only if pages queue up with many people browsing at once. |

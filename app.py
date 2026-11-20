@@ -56,6 +56,7 @@ from services.genre_gate import (
 from services.taste_match import (
     _tasteMatchPercent, _markLinkExternally, _rankById, _sharedRankScore,
 )
+from services.trusted_header import loadTrustedHeaderConfig
 from services.milestones import (
     detectMilestonesDetailed, recalculateMilestoneDates, formatMilestone, EMAILED_MILESTONE_KINDS,
 )
@@ -69,6 +70,7 @@ from routes.wrapped import register as registerWrappedRoutes
 from routes.auth import register as registerAuthRoutes
 from routes.system import register as registerSystemRoutes
 from routes.tags import register as registerTagsRoutes
+from routes.trusted_header import register as registerTrustedHeaderRoutes
 from dashboard.context_processors import register as registerContextProcessors
 from Database.Spotify import Spotify
 from Database.Spotify.cookies import saveSession, parseCookieString
@@ -198,6 +200,17 @@ class SpotifyDashboardApp(ViewModelMixin, PaginationMixin, DateRangeMixin, Wrapp
             # X-Forwarded-* headers set by the reverse proxy in front of this
             # app - request.remote_addr is what the auth rate limiter keys on.
             self.app.wsgi_app = ProxyFix(self.app.wsgi_app, x_for=proxyHops, x_proto=proxyHops, x_host=proxyHops)
+        # Trusted-header mode is read once, like the hop count above, and
+        # validated here so a misconfiguration fails the boot rather than
+        # serving a header-trust path with no proxy allowlist. This must come
+        # after the ProxyFix wrap: the allowlist check reads the address
+        # ProxyFix saved, not the rewritten one.
+        self.trustedHeader = loadTrustedHeaderConfig()
+        if self.trustedHeader.enabled:
+            logger.info(
+                "TRUSTED_HEADER_AUTH is ON: identity comes from %s/%s, trusted only from %s",
+                self.trustedHeader.user_header, self.trustedHeader.email_header,
+                ", ".join(str(network) for network in self.trustedHeader.networks))
         self.baseDir = Path(__file__).resolve().parent
         self.app.secret_key = self._get_or_create_secret_key()
         # Evaluate the data-encryption key material now too, right after the
@@ -526,7 +539,15 @@ class SpotifyDashboardApp(ViewModelMixin, PaginationMixin, DateRangeMixin, Wrapp
         does not exist reads as a guarantee that something is being cleaned
         up."""
         email = session.get("email")
-        if not email or not self.is_user_logged_in(email):
+        if not email:
+            return None, None, None
+        # In trusted-header mode the proxy has already proved this identity.
+        # is_user_logged_in() answers a different question - "is this account's
+        # Spotify session live, i.e. is tracking working" - and requiring it
+        # here would send a header-authenticated user to /login (deliberately
+        # 404 in this mode) whenever Spotify was unreachable or a cookie had
+        # lapsed. The session flag is set only by the trusted-header hook.
+        if not session.get(TRUSTED_HEADER_SESSION_KEY) and not self.is_user_logged_in(email):
             return None, None, None
 
         #< no session-version check here: _endSessionsTheAccountHasInvalidated
@@ -990,6 +1011,12 @@ class SpotifyDashboardApp(ViewModelMixin, PaginationMixin, DateRangeMixin, Wrapp
         registerCompareRoutes(self.app, self)
 
         registerTagsRoutes(self.app, self)
+
+        # Last, so its before_request hook runs AFTER _endSessionsTheAccount-
+        # HasInvalidated above: a header-authenticated session whose version
+        # moved is cleared there and immediately re-established here, rather
+        # than the reverse. No-op unless TRUSTED_HEADER_AUTH is on.
+        registerTrustedHeaderRoutes(self.app, self)
 
     def startWorkers(self):
         """Start the background workers. Call once, from the entry point, after

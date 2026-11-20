@@ -195,6 +195,28 @@ INSTANCE_RESTART_DELAY_SECONDS = 0.5
 # proxy's IP, so the per-IP auth rate limiter would let any one client lock
 # the entire instance out of /login for the whole window.
 TRUST_PROXY_HEADERS_ENV_VAR = "TRUST_PROXY_HEADERS"
+# Trust an identity header set by a forward-auth proxy (Authelia, oauth2-proxy)
+# instead of this app's own login forms. Off by default: an instance that is
+# not behind a proxy must keep proving identity itself, and the fork has to
+# remain a working standalone app when this is unset.
+TRUSTED_HEADER_AUTH_ENV_VAR = "TRUSTED_HEADER_AUTH"
+# The peer ranges header trust is allowed from, comma-separated CIDRs. REQUIRED
+# whenever TRUSTED_HEADER_AUTH is on - the app refuses to start without it (see
+# services/trusted_header.py). This setting IS the security precondition: the
+# header is believed only when the TCP peer is inside one of these ranges.
+TRUSTED_PROXY_CIDRS_ENV_VAR = "TRUSTED_PROXY_CIDRS"
+# The header names the proxy sets. Fixed rather than configurable: a typo in a
+# configurable name would trust a header nothing sends, and the symptom would be
+# a redirect loop rather than a configuration error.
+TRUSTED_HEADER_USER = "Remote-User"
+TRUSTED_HEADER_EMAIL = "Remote-Email"
+# The session key that marks this cookie as established by the proxy rather than
+# by a password/cookies login. get_current_user_or_redirect() reads it to keep
+# authentication (proved upstream) separate from Spotify listener health (a
+# data-source question) - without that split, a Spotify outage or a lapsed
+# cookie would redirect a header-authenticated user to a login form that header
+# mode deliberately no longer serves.
+TRUSTED_HEADER_SESSION_KEY = "trusted_header"
 # When set, the user with this email is made the instance's ONLY admin at
 # startup (see _ensureAdminExists) - the explicit-configuration path, and the
 # recovery path if the automatic earliest-user promotion picked the wrong
