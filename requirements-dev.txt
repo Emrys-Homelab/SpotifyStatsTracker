@@ -11,14 +11,14 @@
 # Pinned for the same reason ruff and eslint are pinned in the lint workflow: a
 # new pytest major can change collection or deprecate an API and turn CI red on
 # a push that touched none of it.
-pytest==9.1.1
+pytest==9.2.0
 pytest-xdist==3.8.0
 
 # Used to find untested paths - routes/system.py's three polled status
 # endpoints were found this way, at 78% with no test at all (they are at 100%
 # now). Not needed to RUN the suite, but declared so `coverage run -m pytest`
 # works from a clone.
-coverage==7.16.2
+coverage==7.17.3
 
 # What lets CI measure coverage without a 7-minute serial run. `coverage run`
 # alone cannot see pytest-xdist's worker SUBPROCESSES - it needs
