@@ -455,3 +455,62 @@ class TestSchemaTemplateRespectsAPatchedSchema(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class LateUsersColumnsUpgradeTest(unittest.TestCase):
+    """The Spotify-account columns were added to `users` after it shipped, and
+    CREATE TABLE IF NOT EXISTS cannot add a column to an existing table. Every
+    installed database therefore needs _ensureLateUsersColumns' explicit ALTER,
+    applied idempotently so a restart (or a second worker thread) is a no-op."""
+
+    _OLD_USERS_DDL = """
+        CREATE TABLE users (
+            username   TEXT PRIMARY KEY,
+            email      TEXT,
+            created_at REAL NOT NULL
+        );
+        INSERT INTO users (username, email, created_at)
+        VALUES ('legacy', 'legacy@example.com', 1.0);
+    """
+
+    def test_an_existing_database_gains_the_columns_and_keeps_its_rows(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            dbPath = Path(tmp) / "old.sqlite"
+            seed = sqlite3.connect(dbPath)
+            seed.executescript(self._OLD_USERS_DDL)
+            seed.commit()
+            seed.close()
+
+            manager = ConnectionManager(dbPath)
+            try:
+                conn = manager.connection()
+                columns = {row["name"] for row in conn.execute("PRAGMA table_info(users)")}
+                self.assertIn("spotify_account_email", columns)
+                self.assertIn("spotify_account_name", columns)
+                row = conn.execute(
+                    "SELECT username, email, spotify_account_email, spotify_account_name "
+                    "FROM users").fetchone()
+                self.assertEqual(tuple(row), ("legacy", "legacy@example.com", None, None))
+            finally:
+                manager.close()
+
+    def test_reopening_the_database_does_not_alter_it_again(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            dbPath = Path(tmp) / "old.sqlite"
+            seed = sqlite3.connect(dbPath)
+            seed.executescript(self._OLD_USERS_DDL)
+            seed.commit()
+            seed.close()
+
+            first = ConnectionManager(dbPath)
+            first.connection()
+            first.close()
+
+            second = ConnectionManager(dbPath)
+            try:
+                with self.assertNoLogs("Database.db", level="INFO"):
+                    columns = {row["name"] for row in second.connection().execute(
+                        "PRAGMA table_info(users)")}
+                self.assertIn("spotify_account_name", columns)
+            finally:
+                second.close()

@@ -221,6 +221,44 @@ class UserQueries:
             return None
         return json.loads(decrypted)
 
+    def setSpotifyIdentity(self, username: str, email: str | None, displayName: str | None = None) -> None:
+        """Record which Spotify account the stored cookies were observed as.
+
+        Separate from users.email on purpose: behind a trusted proxy the login
+        identity is the proxy's, and it no longer has to match the Spotify
+        account. The guard in the WHERE clause makes a re-observation of the
+        same identity a no-op, so a listener rebuild every few minutes does not
+        write the row on every start. `IS NOT` rather than `!=` because both
+        columns start NULL and `!=` is NULL (never true) there.
+        """
+        conn = self._conn()
+        with conn:
+            conn.execute(
+                "UPDATE users SET spotify_account_email=?, spotify_account_name=? "
+                "WHERE username=? AND (spotify_account_email IS NOT ? OR spotify_account_name IS NOT ?)",
+                (email or None, displayName or None, username, email or None, displayName or None),
+            )
+
+    def getSpotifyIdentity(self, username: str) -> dict | None:
+        """The observed Spotify account for `username`, or None when there is
+        no such user or no profile has been read yet.
+
+        An empty dict-shaped answer rather than a raise: the UI treats "not
+        observed" as "fall back to the login identity", and that is the state
+        every pre-upgrade row is in until the next cookie save or listener start.
+        """
+        conn = self._conn()
+        row = conn.execute(
+            "SELECT spotify_account_email, spotify_account_name FROM users WHERE username=?",
+            (username,),
+        ).fetchone()
+        if row is None:
+            return None
+        return {
+            "email": row["spotify_account_email"],
+            "name": row["spotify_account_name"],
+        }
+
     def setUserPassword(self, username: str, passwordHash: str) -> None:
         conn = self._conn()
         with conn:

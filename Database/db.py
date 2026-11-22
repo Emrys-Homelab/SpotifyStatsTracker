@@ -2,9 +2,12 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 
 from __future__ import annotations
+import logging
 import sqlite3
 import threading
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
 
 SQLITE_BUSY_TIMEOUT_MS = 5000   #< how long a writer waits for a lock before raising "database is locked"
 
@@ -348,7 +351,19 @@ CREATE TABLE IF NOT EXISTS users (
     -- number and stops matching the moment it moves. DEFAULT 0 is load-bearing:
     -- a cookie minted before the column existed carries no version at all, and
     -- the guard reads a missing one as 0, so an upgrade logs nobody out.
-    session_version       INTEGER NOT NULL DEFAULT 0
+    session_version       INTEGER NOT NULL DEFAULT 0,
+    -- WHO IS BEING TRACKED, SEPARATE FROM WHO MAY LOG IN. The columns above
+    -- (email, password_hash) are the login identity when this app runs behind a
+    -- trusted proxy: the proxy decides who may use it. These two are the Spotify
+    -- account whose listening the cookies actually read, derived from the
+    -- cookies themselves and shown in the UI. NULL means "not observed yet" -
+    -- older rows gain the value the next time /connect-spotify saves cookies or
+    -- a listener reads the profile. They are deliberately not UNIQUE: the same
+    -- Spotify account may be attached to two login rows (a stale account being
+    -- replaced), and refusing that would turn a UI correction into a 500.
+    -- Added to existing databases by _ensureLateUsersColumns below.
+    spotify_account_email TEXT,
+    spotify_account_name  TEXT
 );
 
 -- Per-user play history. This is the only high-cardinality, per-user table -
@@ -517,6 +532,31 @@ CREATE INDEX IF NOT EXISTS idx_user_milestones_user ON user_milestones(username,
 """
 
 
+# Columns added to `users` after it first shipped. CREATE TABLE IF NOT EXISTS
+# cannot add a column to a table that already exists, and every installed
+# database already has one - so an upgrade needs an explicit ALTER. Applied on
+# each connection that opens the file, guarded by PRAGMA table_info, which
+# makes it idempotent three ways: a fresh database is born with the columns in
+# SCHEMA above and the guard skips them, an upgraded one gains them once, and a
+# restarted process (or a second worker thread) finds them present and does
+# nothing. ALTER TABLE ADD COLUMN with no default is a metadata-only change in
+# SQLite, so it is cheap and safe against a populated table.
+_LATE_USERS_COLUMNS = (
+    ("spotify_account_email", "TEXT"),
+    ("spotify_account_name", "TEXT"),
+)
+
+
+def _ensureLateUsersColumns(conn: sqlite3.Connection) -> None:
+    """Bring an existing `users` table up to SCHEMA's current column set."""
+    existing = {row["name"] for row in conn.execute("PRAGMA table_info(users)")}
+    for name, declaration in _LATE_USERS_COLUMNS:
+        if name in existing:
+            continue
+        conn.execute(f"ALTER TABLE users ADD COLUMN {name} {declaration}")
+        logger.info("Database upgrade: added column users.%s", name)
+
+
 _schemaTemplateLock = threading.Lock()
 _schemaTemplateConn: sqlite3.Connection | None = None
 _schemaTemplateSchema: str | None = None   #< SCHEMA the cached template was built from
@@ -624,6 +664,12 @@ class ConnectionManager:
                 if _stampedSchemaByPath.get(resolvedPath) != SCHEMA:
                     conn.executescript(SCHEMA)   #< idempotent (IF NOT EXISTS); see _stampedSchemaByPath above for why this only runs once per (process, path)
                     _stampedSchemaByPath[resolvedPath] = SCHEMA
+        # Runs on every connection, not behind the SCHEMA stamp above: the
+        # stamp is per (process, path) and would leave a file opened before
+        # this release - or one stamped by another instance - without the
+        # columns. PRAGMA table_info makes the check a read of the real schema
+        # and the ALTER itself a one-time, per-file event.
+        _ensureLateUsersColumns(conn)
         conn.commit()
         return conn
 
