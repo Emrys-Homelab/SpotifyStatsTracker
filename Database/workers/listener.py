@@ -345,6 +345,7 @@ class ListenerMixin:
                 get_credentials=self.getUserSpotifyCredentials,
                 get_backfill_enabled=self.repo.isSpotifyApiBackfillEnabled,
                 on_scope_status_change=self.setSpotifyNeedsReauth,
+                on_identity_observed=self.setSpotifyIdentity,
                 get_recorded_track_ids=self.getRecentlyRecordedTrackIds,
                 process_backfill_page=self.process_backfill_page))
             if self._stopRequested():
@@ -369,26 +370,27 @@ class ListenerMixin:
                 if isReconnect:
                     self.listener_last_rebuild_time = _dbmod.time.time()
                     self.listener_last_rebuild_reason = rebuildReason
-            if self.listener.contaminationDetected:
-                # The cookies authenticate as a different Spotify account (see
-                # Listener.__init__'s contamination check). The listener itself
-                # refuses to record; reflect that as DEAD so the UI shows the user
-                # something actionable instead of a listener that looks healthy
-                # while recording nothing.
+            if getattr(self.listener, "accountChanged", False):
+                # A different Spotify account answered mid-session. Tracking
+                # continues against it (the decoupled model), so this is NOT
+                # DEAD - it is the annotation that explains why the account
+                # label and the recorded plays changed account. Kept in the
+                # health record so it is visible without reading the log.
                 with self._health_lock:
-                    self.listener_health = "DEAD"
+                    observed = getattr(self.listener, "spotify_account_email", None) \
+                        or getattr(self.listener, "spotify_account_name", None)
                     self.listener_last_error = (
-                        "Stored cookies belong to a different Spotify account - "
-                        "re-login with matching cookies to resume tracking"
+                        "Spotify account changed during this session"
+                        + (f" to {observed}" if observed else "")
+                        + " - tracking continues against the new account"
                     )
-                return True
             if self.listener.loginFailed:
                 # The stored cookies didn't authenticate at all (see
-                # Listener.__init__'s isLoggedIn guard) - same DEAD-with-reason
-                # treatment as contaminationDetected, instead of leaving this
-                # user's Database uncached (get_user_db's except-and-rollback,
-                # triggered by the AttributeError this used to raise) with
-                # nothing in the UI explaining why.
+                # Listener.__init__'s isLoggedIn guard) - DEAD with a reason,
+                # instead of leaving this user's Database uncached
+                # (get_user_db's except-and-rollback, triggered by the
+                # AttributeError this used to raise) with nothing in the UI
+                # explaining why.
                 with self._health_lock:
                     self.listener_health = "DEAD"
                     self.listener_last_error = (

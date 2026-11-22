@@ -222,13 +222,24 @@ def formatPlaylistV2(playlistV2: dict) -> dict:
 
 
 def formatProfile(profileResponse: dict) -> dict:
-    """The account-settings profile to the {id, email} pair the listener's
-    contamination check reads. Some account types carry no username, and the
-    listener's own comments record that Spotify then returns the email AS the
-    id - so id falls back to email rather than to None."""
+    """The account-settings profile to the {id, email, display_name} triple the
+    listener's identity check reads. Some account types carry no username, and
+    the listener's own comments record that Spotify then returns the email AS
+    the id - so id falls back to email rather than to None.
+
+    display_name is the label the UI prefers for the Spotify account (see
+    /connect-spotify and the account chrome). It is None when the response
+    carries none, which is a normal state, not an error - every caller falls
+    back to the email. The account-settings endpoint spells the field
+    camelCase; the snake_case and plain `name` spellings are accepted too so a
+    rename upstream degrades to "no display name" instead of silently dropping
+    a field this app now shows to the user."""
     profile = (profileResponse or {}).get("profile") or {}
     email = profile.get("email")
     return {
         "id": profile.get("username") or email,
         "email": email,
+        "display_name": (profile.get("displayName")
+                         or profile.get("display_name")
+                         or profile.get("name")),
     }

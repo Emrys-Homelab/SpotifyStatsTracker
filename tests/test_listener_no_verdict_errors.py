@@ -64,7 +64,6 @@ def _listener(lastKnownResult=True):
     li.sp.isLoggedIn.return_value = True
     li.email = _OWN_SPOTIFY_ID
     li.user = "alice"
-    li.contaminationDetected = False
     li.loginFailed = False
     li._authenticated_user_id = _OWN_SPOTIFY_ID
     li._last_user_validation_time = None

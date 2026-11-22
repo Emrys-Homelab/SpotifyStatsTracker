@@ -395,7 +395,6 @@ class TestStaleReasonReporting(unittest.TestCase):
     def test_an_auth_error_names_its_reason(self):
         listener, onStale = self._listener(), MagicMock()
         listener._stop_event = threading.Event()
-        listener.contaminationDetected = False
         listener._checkOnce = MagicMock(side_effect=RuntimeError("boom"))
 
         with patch("Database.Listeners.spotifyListener._is_auth_error", return_value=True):
@@ -966,12 +965,19 @@ class TestValidateCurrentUser(unittest.TestCase):
         with patch("Database.Listeners.spotifyListener.time.monotonic", return_value=_MONOTONIC_NOW):
             self.assertTrue(listener._validateCurrentUser())
 
-    def test_mismatched_user_returns_false(self):
+    def test_a_changed_user_is_rebaselined_and_kept_running(self):
+        """A different Spotify id mid-session is an account change, not a
+        refusal: the decoupled model tracks whichever account the cookies
+        authenticate as, so validation continues from the new baseline."""
         listener = _bareListener()
         listener._authenticated_user_id = "user1"
-        listener.sp.current_user.return_value = {"id": "user2"}
+        listener.spotify_account_email = "first@example.com"
+        listener.sp.current_user.return_value = {"id": "user2", "email": "second@example.com"}
         with patch("Database.Listeners.spotifyListener.time.monotonic", return_value=_MONOTONIC_NOW):
-            self.assertFalse(listener._validateCurrentUser())
+            self.assertTrue(listener._validateCurrentUser())
+        self.assertEqual(listener._authenticated_user_id, "user2")
+        self.assertEqual(listener.spotify_account_email, "second@example.com")
+        self.assertTrue(listener.accountChanged)
 
     def test_auth_error_returns_false_and_does_not_raise(self):
         listener = _bareListener()
@@ -1054,8 +1060,7 @@ class TestValidationErrorCooldown(unittest.TestCase):
 
     def test_the_cooldown_keeps_reporting_the_last_known_answer(self):
         listener = self._listener()
-        listener.sp.current_user.return_value = {"id": "user2"}   #< a real mismatch
-        self.assertFalse(self._validateAt(listener, _MONOTONIC_NOW))
+        listener._last_user_validation_result = False   #< a real refusal already recorded
 
         laterFailure = _MONOTONIC_NOW + USER_VALIDATION_CACHE_SECONDS + 1
         self._failOnceAt(listener, laterFailure)
@@ -1152,7 +1157,6 @@ class TestLocalPauseIsNotSpotifyPushback(unittest.TestCase):
 
     def test_login_check_stays_logged_in_without_a_warning(self):
         listener = self._listener()
-        listener.contaminationDetected = False
         listener.sp.isLoggedIn.return_value = True
         moduleLogger = logging.getLogger("Database.Listeners.spotifyListener")
         records = []
@@ -1171,7 +1175,6 @@ class TestLocalPauseIsNotSpotifyPushback(unittest.TestCase):
 
         listener = _bareListener()
         listener.user = "7kevinegger"
-        listener.contaminationDetected = False
         listener._stop_event = MagicMock()
         listener._stop_event.is_set.side_effect = [False, True]
         listener._checkOnce = MagicMock(side_effect=SpotifyLocallyRateLimitedError(
@@ -1189,7 +1192,6 @@ class TestLocalPauseIsNotSpotifyPushback(unittest.TestCase):
 
         real = _bareListener()
         real.user = "laurateresaschoen"
-        real.contaminationDetected = False
         real._stop_event = MagicMock()
         real._stop_event.is_set.side_effect = [False, True]
         real._checkOnce = MagicMock(side_effect=Exception("Invalid JSON (Status: 200, Type: str)"))
@@ -1199,7 +1201,6 @@ class TestLocalPauseIsNotSpotifyPushback(unittest.TestCase):
         for username in ("timorzipa", "7kevinegger"):
             refused = _bareListener()
             refused.user = username
-            refused.contaminationDetected = False
             refused._stop_event = MagicMock()
             refused._stop_event.is_set.side_effect = [False, True]
             refused._checkOnce = MagicMock(side_effect=SpotifyLocallyRateLimitedError(
@@ -1381,7 +1382,6 @@ class TestRateLimitBackoffLogging(unittest.TestCase):
     def _runOneRateLimitedIteration(self, user="7kevinegger"):
         listener = _bareListener()
         listener.user = user
-        listener.contaminationDetected = False
         listener._stop_event = MagicMock()
         listener._stop_event.is_set.side_effect = [False, True]  #< one iteration, then stop
         listener._checkOnce = MagicMock(side_effect=Exception(self._ERROR_TEXT))
@@ -1434,7 +1434,6 @@ class TestRateLimitPausesEveryListener(unittest.TestCase):
     def _runOneRateLimitedIteration(self):
         listener = _bareListener()
         listener.user = "7kevinegger"
-        listener.contaminationDetected = False
         listener._stop_event = MagicMock()
         listener._stop_event.is_set.side_effect = [False, True]  #< one iteration, then stop
         listener._checkOnce = MagicMock(side_effect=Exception(self._ERROR_TEXT))
@@ -1468,7 +1467,6 @@ class TestRateLimitPausesEveryListener(unittest.TestCase):
         from Database.rate_limit import SPOTIFY_LIMITER
 
         listener = _bareListener()
-        listener.contaminationDetected = False
         listener._stop_event = MagicMock()
         listener._stop_event.is_set.side_effect = [False, True]
         listener._checkOnce = MagicMock(side_effect=Exception("something else broke"))

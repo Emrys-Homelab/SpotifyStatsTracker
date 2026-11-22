@@ -9,7 +9,7 @@ Listener.__init__, through ConnectionManager.startListener(), into
 get_user_db()'s except-and-rollback - silently uncaching the user, so admin
 showed a generic "Inactive" instead of anything actionable, and the crash
 repeated every 5-minute recheck. A failed login must instead be skipped
-cleanly and reported the same way contaminationDetected already is (see
+cleanly and reported the same way a login failure already is (see
 tests/test_listener_contamination.py): DEAD health with a reason.
 """
 import sys
@@ -195,7 +195,6 @@ class TestLoginFailedListenerHealth(DatabaseTestCase):
 
     def test_login_failed_listener_marks_health_dead(self):
         listener = MagicMock()
-        listener.contaminationDetected = False
         listener.loginFailed = True
 
         db = self._startWithListener(listener)
@@ -207,7 +206,6 @@ class TestLoginFailedListenerHealth(DatabaseTestCase):
 
     def test_logged_in_listener_still_marks_healthy_and_starts(self):
         listener = MagicMock()
-        listener.contaminationDetected = False
         listener.loginFailed = False
 
         db = self._startWithListener(listener)

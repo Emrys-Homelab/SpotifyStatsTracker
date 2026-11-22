@@ -20,11 +20,10 @@ _SECRET_KEY_PATCH = 'app.SpotifyDashboardApp._get_or_create_secret_key'
 
 
 def _healthyListenerMock():
-    """A fake Listener whose contamination/login-failure flags are explicitly
-    clear - a bare MagicMock's auto-created attributes are truthy, which would
-    make Database.startListener treat it as contaminated or login-failed."""
+    """A fake Listener whose login-failure flag is explicitly clear - a bare
+    MagicMock's auto-created attributes are truthy, which would make
+    Database.startListener treat it as a failed login."""
     listener = MagicMock()
-    listener.contaminationDetected = False
     listener.loginFailed = False
     return listener
 
@@ -206,7 +205,6 @@ class TestStartupReloginFromDatabaseCookies(AppTestCase):
         app.repo.setUserCookies("expired", {"sp_dc": "stale"})
         db = MagicMock()
         db.listener.loginFailed = True
-        db.listener.contaminationDetected = False
         db.getListenerHealth.return_value = {"status": "DEAD"}
 
         with patch.object(app, "get_user_db", return_value=db):
@@ -214,22 +212,23 @@ class TestStartupReloginFromDatabaseCookies(AppTestCase):
 
         db.startListener.assert_not_called()
 
-    def test_a_contaminated_listener_is_not_restarted_either(self):
-        """The other half of the same guard: cookies that authenticate as a
-        different Spotify account are just as permanent as ones that don't
-        authenticate at all."""
+    def test_a_different_spotify_account_is_not_a_credential_failure(self):
+        """The login identity and the Spotify account are decoupled, so a
+        listener attached to a different Spotify account is not the permanent
+        bad-cookie case: a DEAD listener with good cookies is restarted like any
+        other crash. Refusing here would leave a decoupled deployment unable to
+        recover at all."""
         app = self._makeApp()
         app.repo.upsertUser("mixed", "mixed@example.com")
         app.repo.setUserCookies("mixed", {"sp_dc": "someone-elses"})
         db = MagicMock()
         db.listener.loginFailed = False
-        db.listener.contaminationDetected = True
         db.getListenerHealth.return_value = {"status": "DEAD"}
 
         with patch.object(app, "get_user_db", return_value=db):
             app._ensureAllUsersLogin()
 
-        db.startListener.assert_not_called()
+        db.startListener.assert_called_once_with(email="mixed@example.com")
 
     def test_a_dead_listener_with_good_credentials_is_still_restarted(self):
         """The guard has to be specifically about credentials. Without this,
@@ -241,7 +240,6 @@ class TestStartupReloginFromDatabaseCookies(AppTestCase):
         app.repo.setUserCookies("crashed", {"sp_dc": "good"})
         db = MagicMock()
         db.listener.loginFailed = False
-        db.listener.contaminationDetected = False
         db.getListenerHealth.return_value = {"status": "DEAD"}
 
         with patch.object(app, "get_user_db", return_value=db):
@@ -261,7 +259,6 @@ class TestStartupReloginFromDatabaseCookies(AppTestCase):
         app.repo.setUserCookies("expired", {"sp_dc": "stale"})
         db = MagicMock()
         db.listener.loginFailed = True
-        db.listener.contaminationDetected = False
         db.getListenerHealth.return_value = {"status": "DEAD"}
 
         with patch.object(app, "get_user_db", return_value=db), \

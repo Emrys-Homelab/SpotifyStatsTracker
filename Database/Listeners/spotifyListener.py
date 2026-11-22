@@ -734,24 +734,40 @@ def _suppress_signal_in_thread():
 class Listener:  #< one user's live playback watcher: cookie session + Web API backfill
     def __init__(self, cookiesFile, refreshInterval=None, email=None, get_credentials=None,
                  get_backfill_enabled=None, on_scope_status_change=None, user=None,
-                 get_recorded_track_ids=None, process_backfill_page=None):
+                 get_recorded_track_ids=None, process_backfill_page=None,
+                 on_identity_observed=None):
         # None (every production caller) means "the shared cadence, jittered
         # for this listener" - see _pollIntervalWithJitter. An explicit value
         # is honoured verbatim so a test can pin it.
         self.refreshInterval = _pollIntervalWithJitter() if refreshInterval is None else refreshInterval
         self.run = False   #< startListener() raises it; stop()/signalStop() clear it
         self._stop_event = threading.Event()
-        self.email = email  #< store expected email for validation
+        self.email = email  #< the LOGIN identity (who may use the app), not necessarily the Spotify account
         # Internal user key (e.g. "7kevinegger"), used for log identification so
         # the routine per-poll lines don't write an email address to disk
-        # thousands of times a day. The email stays authoritative for the
-        # identity checks below - only the LOG representation changes. Falls
-        # back to the email when no key was passed (older callers, tests), since
-        # an unidentifiable log line is worse than a private one.
+        # thousands of times a day. Falls back to the email when no key was
+        # passed (older callers, tests), since an unidentifiable log line is
+        # worse than a private one.
         self.user = user
         self._authenticated_user_id = None  #< cache spotify user id for validation
-        self.contaminationDetected = False  #< True when the cookies authenticate as a DIFFERENT account than self.email
+        # THE SPOTIFY ACCOUNT, DERIVED FROM THE COOKIES. Deliberately separate
+        # from self.email (the login identity): behind a trusted proxy they are
+        # allowed to differ, and a difference is not an error. See
+        # _captureIdentityBaseline and routes/trusted_header.py.
+        self.spotify_account_email = None
+        self.spotify_account_name = None
+        #< an annotation, never a refusal: True once an account DIFFERENT from
+        #  the one this listener started with answers mid-session. Tracking
+        #  continues against the new account; the UI's Spotify-account label is
+        #  refreshed through on_identity_observed.
+        self.accountChanged = False
         self.loginFailed = False  #< True when the stored cookies didn't authenticate at all (see below)
+        # Optional callback(identity: dict) called whenever the profile read
+        # yields the Spotify account - from __init__ and from a mid-session
+        # account change. Lets the caller persist the observed identity (the
+        # columns the UI shows) without the listener knowing about a database.
+        # None (tests, callers that don't care) means it is only logged.
+        self.on_identity_observed = on_identity_observed
         self.get_credentials = get_credentials
         # Optional admin kill switch, re-read each poll (like get_credentials)
         # so a restart is never needed to see a flip - None (the default for
@@ -807,8 +823,7 @@ class Listener:  #< one user's live playback watcher: cookie session + Web API b
                     # authenticate. startRecentlyPlayedListener() would refuse
                     # with a ValueError in that state; skip it and let
                     # startListener() (Database/workers/listener.py) report this
-                    # the same way it already does for contaminationDetected
-                    # below.
+                    # the same way it already does for a failed login below.
                     self.loginFailed = True
                     logger.warning("Spotify login failed for user %s - stored cookies may be invalid or expired", self.logUser)
 
@@ -819,8 +834,7 @@ class Listener:  #< one user's live playback watcher: cookie session + Web API b
                 # The Spotify id used to be logged alongside this - but for these
                 # accounts Spotify returns the email AS the id, so the line printed
                 # the address twice. It stays available on self._authenticated_user_id
-                # and is reported by the contamination/validation errors, which are
-                # the only places it actually distinguishes anything.
+                # and is reported by the account-change/validation warnings.
                 # DEBUG: a Listener is rebuilt on every stale-feed reconnect, so
                 # this fired 1,568 times in 11 days for 3 users. The worker's own
                 # start/stop lines cover the lifecycle events worth seeing.
@@ -834,7 +848,9 @@ class Listener:  #< one user's live playback watcher: cookie session + Web API b
                 # every answer whoever it named.
                 logger.warning("Could not verify authenticated user during listener init: %s", parseError(e))
 
-            if (self.loginFailed or self.contaminationDetected) and self.user:
+            # Only a real authentication failure notifies: an account switch is
+            # an annotation the log and the UI carry, not a broken credential.
+            if self.loginFailed and self.user:
                 from services.email_worker import queue_email_notification
                 from Database.queries.email_queries import EVENT_INVALID_COOKIES
                 queue_email_notification(self.user, EVENT_INVALID_COOKIES)
@@ -899,11 +915,6 @@ class Listener:  #< one user's live playback watcher: cookie session + Web API b
         return self.user or self.email
 
     def isLoggedIn(self) -> bool:
-        # A contaminated session is technically logged in - as the WRONG
-        # account. Reporting False routes the user back through the login
-        # flow, whose cookie verification requires the matching account.
-        if self.contaminationDetected:
-            return False
         if not self.sp.isLoggedIn():
             return False   #< the client's own cookie-level verdict
         try:
@@ -963,36 +974,79 @@ class Listener:  #< one user's live playback watcher: cookie session + Web API b
 
     def _captureIdentityBaseline(self, current_user: dict) -> bool:
         """Adopt the session's Spotify id as the identity every later
-        _validateCurrentUser answer is compared against, and check the
-        session's email against the account the cookies are stored under.
-        Returns False when that email proves the session is another account's.
+        _validateCurrentUser answer is compared against, and record the
+        account's own email and display name as WHOSE LISTENING this is.
 
-        CRITICAL: Verify cookies actually belong to the expected user, not a
-        different account. Detection alone isn't enough - the flag set here
-        makes this listener refuse to record anything (see startListener/
-        isLoggedIn): without it, plays from the wrong account kept being
-        recorded under this user, and the id comparison was no help because
-        it baselines on _authenticated_user_id, i.e. the WRONG account's own
-        id, so the ongoing check always passed. Only a real, non-empty string
-        email is proof of a mismatch - Spotify can return "email": null, which
-        must not read as contamination.
+        Returns True - a baseline is always adoptable. This used to return
+        False when the Spotify account's email differed from the account's
+        login email, and set contaminationDetected so the listener refused to
+        record. That refusal is exactly what made the decoupled trusted-header
+        login pointless: the proxy decides who may use the app, and the cookies
+        decide whose listening is tracked. In a one-user deployment those are
+        routinely different, so a difference is the expected state and the
+        Spotify account is recorded (and shown in the UI) instead.
+
+        A CHANGE of Spotify account mid-session is still worth noticing, but
+        it is _validateCurrentUser's job (it compares the id against this
+        baseline) and it announces itself there as a warning and a rebaseline,
+        not a refusal. Only a real, non-empty string email is recorded as an
+        identity - Spotify can return "email": null, which must not overwrite
+        a previously observed address.
 
         Runs from __init__, and again from _validateCurrentUser's first
-        successful answer when the build-time call raised and left no
-        baseline - the same comparison either way, so a listener whose
-        constructor met a bot-check page is not unguarded for life."""
+        successful answer when the build-time call raised and left no baseline,
+        and again on a mid-session account change."""
         self._authenticated_user_id = current_user.get("id")
-        authenticated_email = current_user.get("email")
-        if isinstance(authenticated_email, str) and authenticated_email and self.email:
-            if authenticated_email.lower() != self.email.lower():
-                self.contaminationDetected = True
-                logger.error(
-                    "CRITICAL: Cookie contamination detected! Cookies for %s are actually authenticated as %s. "
-                    "Recording is disabled for this listener so plays from %s are NOT recorded under %s's account. "
-                    "The stored cookies must be re-authorized.",
-                    self.email, authenticated_email, authenticated_email, self.email
-                )
-                return False
+
+        observedEmail = current_user.get("email")
+        if not isinstance(observedEmail, str) or not observedEmail.strip():
+            observedEmail = None
+        else:
+            observedEmail = observedEmail.strip()
+        observedName = current_user.get("display_name")
+        if not isinstance(observedName, str) or not observedName.strip():
+            observedName = None
+        else:
+            observedName = observedName.strip()
+
+        previousEmail = getattr(self, "spotify_account_email", None)
+        if observedEmail and previousEmail \
+                and observedEmail.lower() != previousEmail.lower():
+            # The profile endpoint now names a different account than the one
+            # this listener started with, or the one its cookies previously
+            # reported. Not contamination to refuse - the decoupled model says
+            # the login identity is independent - but a switch the operator
+            # should be able to find in the log, with tracking continuing
+            # against whichever account is actually attached now.
+            self.accountChanged = True
+            logger.warning(
+                "Spotify account for user %s changed mid-session: %s -> %s. "
+                "Recording continues against the new account; replace the stored "
+                "cookies if that is not the account you meant to track.",
+                self.logUser, previousEmail, observedEmail)
+        else:
+            logger.debug(
+                "Listener tracking Spotify account %s for user %s (login identity %s)",
+                observedEmail or observedName or "<not reported>", self.logUser, self.email)
+
+        if observedEmail:
+            self.spotify_account_email = observedEmail
+        if observedName:
+            self.spotify_account_name = observedName
+
+        onIdentityObserved = getattr(self, "on_identity_observed", None)
+        if onIdentityObserved:
+            try:
+                onIdentityObserved({
+                    "email": observedEmail,
+                    "name": observedName,
+                    "id": self._authenticated_user_id,
+                })
+            except Exception as e:
+                # The label is cosmetic; a database hiccup must not stop a
+                # listener that is otherwise recording plays.
+                logger.warning("Could not report the observed Spotify identity for user %s: %s",
+                               self.logUser, parseError(e))
         return True
 
     def _validationIsOnCooldown(self, now: float) -> bool:
@@ -1025,10 +1079,10 @@ class Listener:  #< one user's live playback watcher: cookie session + Web API b
             # The last KNOWN answer, which on a listener that has never had one
             # is the constructor's optimistic default. That is unchanged
             # behaviour: the 5-minute success cache always returned it too for
-            # the window after any check, and __init__'s contamination check
-            # (or, when that raised, the first successful validation's - see
-            # _captureIdentityBaseline) is what actually guards against
-            # recording under the wrong account.
+            # the window after any check, and __init__'s baseline capture (or,
+            # when that raised, the first successful validation's - see
+            # _captureIdentityBaseline) is what keeps the Spotify identity
+            # current.
             return self._last_user_validation_result
 
         try:
@@ -1038,18 +1092,16 @@ class Listener:  #< one user's live playback watcher: cookie session + Web API b
                 # No baseline: __init__'s own identity check raised and the
                 # guard below had nothing to compare against - before this
                 # branch existed, for the listener's whole life. This first
-                # answer becomes the baseline, through the same email
-                # comparison __init__ makes; a mismatch is the contamination
-                # that comparison exists to catch, and False here hands the
-                # loop to onStale (see _checkOnce), so the rebuilt listener's
-                # own __init__ check is what refuses to record.
+                # answer becomes the baseline.
                 result = self._captureIdentityBaseline(current_user)
             elif current_user_id != self._authenticated_user_id:
-                logger.error(
-                    "Session user mismatch! Expected %s, got %s - this could indicate cross-user contamination",
-                    self._authenticated_user_id, current_user_id
-                )
-                result = False
+                # The Spotify account CHANGED mid-session. Under the decoupled
+                # model that is not a refusal: the login identity is the
+                # proxy's, and tracking follows whichever Spotify account the
+                # cookies now authenticate as. It is rebaselined (so the next
+                # poll does not warn again) and reported - _captureIdentityBaseline
+                # logs the warning and refreshes the recorded identity.
+                result = self._captureIdentityBaseline(current_user)
             else:
                 result = True
 
@@ -1446,7 +1498,8 @@ class Listener:  #< one user's live playback watcher: cookie session + Web API b
         stale and handed off to `onStale` for reconnection - the caller should
         stop this listener, since a new one now owns tracking. Raises an exception
         if an auth error is detected so startListener can handle it immediately."""
-        # Validate session identity to detect cross-user contamination
+        # Validate session identity; a changed account is rebaselined and logged
+        # by _validateCurrentUser rather than treated as a refusal.
         if not self._validateCurrentUser():
             logger.error("Listener session validation failed - triggering reconnection")
             if onStale is not None:
@@ -1545,16 +1598,6 @@ class Listener:  #< one user's live playback watcher: cookie session + Web API b
         return False
 
     def startListener(self, callback, onStale=None, onWebApiSnapshot=None):
-        if self.contaminationDetected:
-            # Never record from a session that belongs to a different account -
-            # see the contamination check in __init__.
-            logger.error(
-                "Listener for %s not started: the stored cookies authenticate as a "
-                "different Spotify account. Re-login with matching cookies to resume tracking.",
-                self.logUser,
-            )
-            self.run = False
-            return
         self.run = True   #< from here only _checkOnce/auth errors or a stop signal end the loop
         while self.run and not self._stop_event.is_set():
             try:
@@ -1656,8 +1699,8 @@ class Listener:  #< one user's live playback watcher: cookie session + Web API b
                 logger.warning("Could not obtain access token for Web API backfill for user %s.", self.logUser)
                 return
 
-            # Validate that the access token belongs to the authenticated user,
-            # not a different Spotify account (prevents cross-user contamination)
+            # Validate that the access token belongs to the tracked Spotify
+            # account, not a different one (prevents cross-user contamination)
             web_api_user = _get_current_user_from_web_api(access_token, logUser=self.logUser)
             if not web_api_user:
                 logger.warning("Could not validate Web API user, skipping backfill for user %s.", self.logUser)
@@ -1667,8 +1710,9 @@ class Listener:  #< one user's live playback watcher: cookie session + Web API b
             web_api_user_display = web_api_user.get("display_name", web_api_user_id)
             web_api_user_email = web_api_user.get("email", "")
             if _flaskDebugEnabled():
-                logger.info("Web API user: %s (ID: %s, email: %s), Listener email: %s",
-                           web_api_user_display, web_api_user_id, web_api_user_email, self.email)
+                logger.info("Web API user: %s (ID: %s, email: %s), tracked Spotify account: %s",
+                           web_api_user_display, web_api_user_id, web_api_user_email,
+                           getattr(self, "spotify_account_email", None) or self.email)
 
             # Validate that the access token belongs to the authenticated user.
             # The email is the strongest reading, but /v1/me only carries one
@@ -1688,10 +1732,17 @@ class Listener:  #< one user's live playback watcher: cookie session + Web API b
             mismatch = False
             identityConfirmed = False  #< the comparison actually RAN and passed
             cookieUserId = self._authenticated_user_id
-            if self.email and web_api_user_email and self.email.lower() != web_api_user_email.lower():
+            # Compared against the SPOTIFY account, not the login identity: the
+            # trusted-header proxy's email is not the account the OAuth grant
+            # belongs to, and comparing against it would skip every backfill on
+            # a decoupled deployment. Falls back to the login identity when the
+            # profile read has not named an account (older rows, a bot-checked
+            # startup).
+            trackedEmail = getattr(self, "spotify_account_email", None) or self.email
+            if trackedEmail and web_api_user_email and trackedEmail.lower() != web_api_user_email.lower():
                 mismatch = True
-                mismatch_reason = f"email mismatch: API has {web_api_user_email}, listener is {self.email}"
-            elif self.email and web_api_user_email:
+                mismatch_reason = f"email mismatch: API has {web_api_user_email}, tracked account is {trackedEmail}"
+            elif trackedEmail and web_api_user_email:
                 identityConfirmed = True
             elif (_isComparableSpotifyUserId(cookieUserId) and _isComparableSpotifyUserId(web_api_user_id)
                   and cookieUserId.lower() != web_api_user_id.lower()):

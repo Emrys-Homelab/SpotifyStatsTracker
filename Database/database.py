@@ -2102,6 +2102,22 @@ class Database(MediaFetchMixin, ImportMixin, WorkerLifecycleMixin):
             from Database.queries.email_queries import EVENT_API_KEY_FAILED
             queue_email_notification(self.user, EVENT_API_KEY_FAILED)
 
+    def setSpotifyIdentity(self, observed: dict | None) -> None:
+        """Persist the Spotify account a listener's profile read observed.
+
+        Bound to this user and handed to the Listener as on_identity_observed,
+        so the header/account pages can name the Spotify account the cookies
+        actually read without the listener knowing about the database. A failed
+        write is only a stale label, so it is logged and swallowed rather than
+        stopping a listener that is recording plays.
+        """
+        if not observed:
+            return
+        try:
+            self.repo.setSpotifyIdentity(self.user, observed.get("email"), observed.get("name"))
+        except Exception as e:
+            logger.warning("Could not record the Spotify identity for user %s: %s", self.user, e)
+
     def getRecentlyRecordedTrackIds(self, trackIds: list[str]) -> set[str]:
         """Which of these tracks this user already has a recent play for.
         Bound to this user and handed to the Listener as a callback, so the

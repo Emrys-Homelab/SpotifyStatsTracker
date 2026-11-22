@@ -34,7 +34,6 @@ class SessionTrackingTestBase(unittest.TestCase):
         with patch.object(db, '_withCookiesFile') as mock_cookies, \
              patch('Database.database.Listener'):
             mock_listener = MagicMock()
-            mock_listener.contaminationDetected = False  #< a bare MagicMock's auto-attribute is truthy = contaminated
             mock_listener.loginFailed = False  #< same trap - see above
             mock_cookies.return_value = mock_listener
             if rebuildReason is None:
