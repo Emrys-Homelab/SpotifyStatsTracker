@@ -33,3 +33,18 @@ COPY auth.py /app/routes/auth.py
 COPY trusted_header_route.py /app/routes/trusted_header.py
 COPY trusted_header_service.py /app/services/trusted_header.py
 COPY connect_spotify.html /app/templates/connect_spotify.html
+# The decoupled-identity change touches the schema, the user queries, the
+# listener and the templates/chrome that name the Spotify account. Flat source
+# names are the builder's constraint (see above); the destinations are the
+# paths the app already imports or reads.
+COPY db_schema.py /app/Database/db.py
+COPY users_queries.py /app/Database/queries/users.py
+COPY spotify_formatting.py /app/Database/Spotify/formatting.py
+COPY spotify_listener.py /app/Database/Listeners/spotifyListener.py
+COPY listener_worker.py /app/Database/workers/listener.py
+COPY database.py /app/Database/database.py
+COPY context_processors.py /app/dashboard/context_processors.py
+COPY layout.html /app/templates/layout.html
+COPY profile_base.html /app/templates/_profile_base.html
+COPY tracks.html /app/templates/tracks.html
+COPY style.css /app/static/css/style.css

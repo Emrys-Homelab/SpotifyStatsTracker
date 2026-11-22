@@ -16,8 +16,10 @@ builder cannot take this repository's own Dockerfile.
   ConfigMap's 1 MiB limit). Even a tar of the source is larger.
 
 The overlay avoids both: the base is the upstream release image, pinned by
-digest, and the context is six flat files that replace or add exactly the
-files this patch series changed. `make-context.sh` stages them from the
+digest, and the context is the flat files that replace or add exactly the
+files this patch series changed (six for trusted-header mode; the decoupled
+identity change adds the schema, user-query, listener, worker and template
+files it touches). `make-context.sh` stages them from the
 checkout, so there is no second copy to drift.
 
 ## Build

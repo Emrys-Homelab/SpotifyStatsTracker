@@ -43,7 +43,11 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 #< .claude/worktrees holds a COMPLETE second copy of the tree per agent worktree,
 #  so a root-anchored walk found every exempt site again under a path the
 #  allowlist does not name - the .dockerignore trap in a test's clothing.
-SKIPPED_DIRECTORIES = {".venv", "tests", "__pycache__", ".git", "node_modules", ".claude"}
+#< .context is make-context.sh's GENERATED build context: flat copies of source
+#  files, so walking it finds every guarded block a second time under a path
+#  nobody edits
+SKIPPED_DIRECTORIES = {".venv", "tests", "__pycache__", ".git", "node_modules", ".claude",
+                       ".context"}
 
 READ_KEYWORDS = ("SELECT", "PRAGMA", "WITH", "EXPLAIN")
 WRITE_KEYWORDS = ("INSERT", "UPDATE", "DELETE", "REPLACE", "CREATE", "ALTER",

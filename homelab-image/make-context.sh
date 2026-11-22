@@ -34,6 +34,17 @@ copy routes/auth.py auth.py
 copy routes/trusted_header.py trusted_header_route.py
 copy services/trusted_header.py trusted_header_service.py
 copy templates/connect_spotify.html connect_spotify.html
+copy Database/db.py db_schema.py
+copy Database/queries/users.py users_queries.py
+copy Database/Spotify/formatting.py spotify_formatting.py
+copy Database/Listeners/spotifyListener.py spotify_listener.py
+copy Database/workers/listener.py listener_worker.py
+copy Database/database.py database.py
+copy dashboard/context_processors.py context_processors.py
+copy templates/layout.html layout.html
+copy templates/_profile_base.html profile_base.html
+copy templates/tracks.html tracks.html
+copy static/css/style.css style.css
 cp "$here/Dockerfile" "$ctx/Dockerfile"
 
 echo "make-context: staged $ctx"
