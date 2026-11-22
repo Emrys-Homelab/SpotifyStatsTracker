@@ -444,52 +444,96 @@ class SpotifyDashboardApp(ViewModelMixin, PaginationMixin, DateRangeMixin, Wrapp
         if promoted:
             logger.info("Promoted earliest-created user %s to admin (no admin existed yet)", promoted)
 
-    def _verifyCookiesMatchEmail(self, cookies: dict, email: str) -> bool:
-        """Check that the submitted Spotify cookies actually belong to `email` by
-        fetching the account profile with them. The cookies are written to a
-        throwaway session file so an unverified login attempt can never overwrite
-        another user's stored cookies. Without this check, anyone could claim any
-        email at login and be handed that user's database."""
-        if not cookies or not email:
-            return False
+    def fetchSpotifyProfile(self, cookies: dict) -> dict | None:
+        """Ask Spotify whose cookies these are: {"email", "name", "id"} or None.
 
-        tmpFd, tmpPath = tempfile.mkstemp(prefix="verify_cookies_", suffix=".json")
+        This answers a DIFFERENT question from ``verifyCookiesForEmail``: not
+        "may this person use the app" (the trusted proxy or the password form
+        answers that) but "whose listening would this session read". It is the
+        source of the Spotify identity shown in the UI, and it is deliberately
+        not a gate - a profile fetch that fails (a bot-check page, a rate limit,
+        a transport failure) returns None and the caller stores the cookies
+        anyway, because tracking frequently works even when the metadata read
+        did not.
+
+        The cookies go to a THROWAWAY session file, so an attempt that cannot
+        be identified never touches the account's stored cookies, and the
+        session is closed afterwards: every login builds its own TLS client,
+        each of which is atexit-pinned until the process exits.
+        """
+        if not cookies:
+            return None
+
+        tmpFd, tmpPath = tempfile.mkstemp(prefix="spotify_profile_", suffix=".json")
         os.close(tmpFd)
         sp = None
         try:
-            saveSession(cookies, email, tmpPath)
+            # A non-empty synthetic identifier: Spotify.login() resolves the
+            # session by identifier, and an empty string is falsy there.
+            saveSession(cookies, "spotify-profile-lookup", tmpPath)
             with _suppress_signal_in_thread():
-                sp = Spotify(cookiesFile=tmpPath, email=email)
+                sp = Spotify(cookiesFile=tmpPath, email="spotify-profile-lookup")
             if not sp.isLoggedIn():
-                return False
+                return None
             profile = sp.current_user() or {}
-            profileEmail = (profile.get("email") or "").strip().lower()
-            return profileEmail == email.strip().lower()
+            email = (profile.get("email") or "").strip() or None
+            name = (profile.get("display_name") or "").strip() or None
+            return {"email": email, "name": name, "id": profile.get("id")}
         except Exception as e:
-            logger.warning("Cookie verification failed for %s: %s", email, e)
-            return False
+            logger.warning("Spotify profile lookup failed (cookies kept anyway): %s", e)
+            return None
         finally:
             if sp is not None:
-                # This login built its own TLS client, and every one of those
-                # is atexit-pinned until the process exits - so a session left
-                # open here accumulated one per login/register/reset attempt.
                 sp.close()
             try:
                 os.unlink(tmpPath)
             except OSError:
                 pass
 
+    def recordSpotifyIdentity(self, username: str, profile: dict | None) -> None:
+        """Persist the observed Spotify account on the user row.
+
+        A no-op when the profile is None (nothing was learned) or when the
+        values already match - the repo's UPDATE has the same guard, but
+        skipping the call here keeps a listener's per-rebuild callback from
+        touching the database at all in the common case.
+        """
+        if not profile:
+            return
+        try:
+            self.repo.setSpotifyIdentity(username, profile.get("email"), profile.get("name"))
+        except Exception as e:
+            # Cosmetic state only: failing to record the label must never fail
+            # a login or stop a listener that is otherwise recording plays.
+            logger.warning("Could not record the Spotify identity for %s: %s", username, e)
+
+    def _verifyCookiesMatchEmail(self, cookies: dict, email: str) -> bool:
+        """Check that the submitted Spotify cookies actually belong to `email`.
+
+        Kept for the three STANDALONE doors (login/register/reset-password),
+        where the cookies are the credential and the email is the account key -
+        accepting a mismatched pair there would hand one user's database to
+        anyone who knew their email. The trusted-header /connect-spotify page
+        deliberately does NOT use this: there the proxy has already decided who
+        may log in, and the Spotify account is allowed to be a different one.
+        """
+        if not cookies or not email:
+            return False
+        profile = self.fetchSpotifyProfile(cookies)
+        if profile is None:
+            return False
+        profileEmail = (profile.get("email") or "").strip().lower()
+        return profileEmail == email.strip().lower()
+
     def verifyCookiesForEmail(self, cookies: str, email: str):
         """The parsed cookies, or None when they don't provably belong to `email`.
 
-        One implementation for every door that accepts Spotify cookies: the
-        three standalone forms (login/register/reset-password, through
-        routes/auth.py's _verifiedCookies) and the trusted-header
-        /connect-spotify page. They must ask the same question - the per-user
-        Listener refuses to record a session whose Spotify email differs from
-        the account's email (see spotifyListener._captureIdentityBaseline), so
-        accepting a mismatched session here would store a credential that can
-        never track.
+        The standalone forms' ownership check (see routes/auth.py's
+        _verifiedCookies). The trusted-header /connect-spotify page used to
+        share it; it no longer does, because in a one-user SSO deployment the
+        login email and the Spotify account are separate things and a
+        mismatch is the normal case, not a contamination (see
+        routes/trusted_header.py).
 
         SKIP_EMAIL_VERIFICATION remains the explicit, instance-wide opt-out of
         the ownership check (see config.py); it is deliberately unchanged.
@@ -759,12 +803,15 @@ class SpotifyDashboardApp(ViewModelMixin, PaginationMixin, DateRangeMixin, Wrapp
             try:
                 db = self.get_user_db(username, email)
                 # If listener has crashed, marked DEAD, or its thread has stopped, restart it -
-                # UNLESS the last start failed on definitively bad/mismatched cookies. Those
-                # never recover by retrying (every restart re-attempts the same failing Spotify
+                # UNLESS the last start failed on definitively bad cookies. Those never
+                # recover by retrying (every restart re-attempts the same failing Spotify
                 # login, risking bot-detection/rate-limit escalation); only a fresh re-login
                 # (which rebuilds the listener via _refresh_user_session) should retry them.
+                # A DIFFERENT Spotify account is no longer in this set: the login identity
+                # and the tracked account are decoupled, so a mismatch is not a credential
+                # failure (see Listener._captureIdentityBaseline).
                 listener = db.listener
-                credentialFailure = listener is not None and (listener.loginFailed or listener.contaminationDetected)
+                credentialFailure = listener is not None and listener.loginFailed
                 needsRestart = db.getListenerHealth()["status"] == "DEAD" or not (
                     listener and listener.thread and listener.thread.is_alive()
                 )

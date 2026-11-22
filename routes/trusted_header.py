@@ -19,9 +19,17 @@ module adds on top of it:
   to log in but NOT to track: ``is_user_logged_in()`` is False while
   ``users.cookies_json`` is NULL, and the per-user listener that records plays
   is built from those cookies. The cookie page is where that one remaining
-  credential is supplied, and the ownership check is the same one the
-  standalone forms use - the Spotify account's email must match the trusted
-  email, or the listener would (correctly) refuse to record as contamination.
+  credential is supplied.
+
+THE TWO IDENTITIES ARE DELIBERATELY DECOUPLED. The proxy decides who may use
+the app (``users.email``); the cookies decide whose listening is tracked
+(``users.spotify_account_email`` / ``spotify_account_name``). They are allowed
+to be different people's, and in a one-user SSO deployment that is the normal
+case, not a mistake. ``/connect-spotify`` therefore does NOT verify the cookies
+against the account email the way the standalone login/register/reset forms
+still do: it accepts them, asks Spotify who they are, records that answer, and
+says so on the page. A failed profile read is reported plainly and the cookies
+are still saved - tracking often works even when the metadata call did not.
 
 The refusal branches are deliberately NOT redirects to the login form:
 an untrusted peer, or a missing identity header, is a misconfiguration or an
@@ -32,8 +40,8 @@ import logging
 
 from flask import Response, abort, redirect, render_template, request, session, url_for
 
+from Database.Spotify.cookies import parseCookieString
 from config import SESSION_VERSION_KEY, TRUSTED_HEADER_SESSION_KEY
-from routes.auth import COOKIE_OWNERSHIP_ERROR
 from services.trusted_header import (
     identityFromHeaders,
     isTrustedPeer,
@@ -41,6 +49,10 @@ from services.trusted_header import (
 )
 
 logger = logging.getLogger(__name__)
+
+# One-shot result of the last POST, popped on the redirect that follows it -
+# the page is rendered by a GET so a refresh does not re-save the cookies.
+CONNECT_NOTICE_KEY = "connect_spotify_notice"
 
 # Routes that must keep working without an identity header. /health is the
 # kubelet's probe (its peer is the node, never the proxy) and static assets
@@ -153,7 +165,13 @@ def register(app, dashboard) -> None:
 
     @app.route("/connect-spotify", methods=["GET", "POST"])
     def connectSpotify():
-        """Supply the one credential the SSO proxy cannot: a Spotify session."""
+        """Supply the one credential the SSO proxy cannot: a Spotify session.
+
+        It answers "whose listening should be tracked?", not "who are you?" -
+        the proxy already answered the second. So the cookies are not checked
+        against the signed-in email; they are SAVED, and the profile read below
+        names the account they actually belong to.
+        """
         email = session.get("email")
         if not email or session.get(TRUSTED_HEADER_SESSION_KEY) is not True:
             abort(403)
@@ -164,28 +182,50 @@ def register(app, dashboard) -> None:
         error = None
         if request.method == "POST":
             cookies = request.form.get("cookies", "").strip()
-            if not cookies:
-                error = "Paste the cookies from your Spotify session."
+            parsed = parseCookieString(cookies)
+            if not parsed:
+                error = ("Paste the cookies from your Spotify session - that text "
+                         "did not contain any cookies.")
             else:
-                parsed = dashboard.verifyCookiesForEmail(cookies, email)
-                if parsed is None:
-                    error = COOKIE_OWNERSHIP_ERROR.format(email=email)
-                else:
-                    dashboard.repo.setUserCookies(username, parsed)
-                    # A user who re-connects after an expiry already has a
-                    # Database (and a dead listener); a first login does not.
-                    # Both paths must leave a listener built from the NEW
-                    # cookies and no stale login-status cache.
-                    dashboard._invalidateLoginCache(email)
+                # THE PROFILE READ IS THE POINT, NOT A GATE. It returns None on
+                # a bot-check page, a rate limit or a transport failure, and
+                # the cookies are stored regardless: tracking may well work
+                # even when the label could not be read.
+                profile = dashboard.fetchSpotifyProfile(parsed)
+                dashboard.repo.setUserCookies(username, parsed)
+                if profile:
+                    dashboard.recordSpotifyIdentity(username, profile)
+
+                session[CONNECT_NOTICE_KEY] = {
+                    "email": (profile or {}).get("email"),
+                    "name": (profile or {}).get("name"),
+                    "observed": profile is not None,
+                }
+
+                # A user who re-connects after an expiry already has a
+                # Database (and a dead listener); a first login does not.
+                # Both paths must leave a listener built from the NEW
+                # cookies and no stale login-status cache. A listener that
+                # cannot start is reported in the app (health DEAD) - it must
+                # not turn "cookies saved" into a 500.
+                dashboard._invalidateLoginCache(email)
+                try:
                     if username in dashboard.user_databases:
                         dashboard._refresh_user_session(username, email)
                     else:
                         dashboard.get_user_db(username, email)
-                    return redirect(url_for("dashboard"))
+                except Exception as e:
+                    logger.error(
+                        "Spotify session saved for %s, but its listener could not be started: %s",
+                        username, e)
 
+                return redirect(url_for("connectSpotify"))
+
+        notice = session.pop(CONNECT_NOTICE_KEY, None)
         return render_template(
             "connect_spotify.html",
             email=email,
             error=error,
+            notice=notice,
             has_cookies=dashboard.repo.getUserCookies(username) is not None,
         )

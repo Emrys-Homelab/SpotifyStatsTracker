@@ -249,23 +249,62 @@ class TrustedHeaderRequestTestCase(unittest.TestCase):
         self.assertIn("Connect Spotify", body)
         self.assertIn("How to locate your session data", body)
 
-    def test_the_cookie_page_rejects_cookies_that_are_not_this_accounts(self):
+    def test_cookies_for_a_different_spotify_account_are_accepted_and_named(self):
+        """The decoupling, end to end: the login identity is the proxy's, and
+        the cookies may belong to a different Spotify account. They are saved,
+        the profile read names the account, and the page says so."""
         dash = self._makeApp()
         client = dash.app.test_client()
-        with patch.object(dash, "verifyCookiesForEmail", return_value=None):
+        profile = {"email": "someone-else@example.com", "name": "Someone Else"}
+        with patch.object(dash, "fetchSpotifyProfile", return_value=profile), \
+             patch.object(dash, "get_user_db", return_value=MagicMock()), \
+             patch.object(dash, "is_user_logged_in", return_value=False):
             response = client.post(
                 "/connect-spotify", data={"cookies": "sp_dc=someone-else"},
                 headers={"Remote-User": "myrddin"},
                 environ_base={"REMOTE_ADDR": PROXY_PEER})
+            self.assertEqual(response.status_code, 302)
+            self.assertTrue(response.headers["Location"].endswith("/connect-spotify"))
 
-        self.assertEqual(response.status_code, 200)
-        self.assertIn("Couldn&#39;t verify", response.get_data(as_text=True))
+            # Follow the redirect: the page reports what it found.
+            page = client.get("/connect-spotify", headers={"Remote-User": "myrddin"},
+                              environ_base={"REMOTE_ADDR": PROXY_PEER})
 
-    def test_the_cookie_page_saves_a_verified_session_and_returns_to_the_app(self):
+        self.assertEqual(dash.repo.getUserCookies("myrddin"), {"sp_dc": "someone-else"})
+        self.assertEqual(dash.repo.getSpotifyIdentity("myrddin"),
+                         {"email": "someone-else@example.com", "name": "Someone Else"})
+        body = page.get_data(as_text=True)
+        self.assertIn("Connected to Spotify as", body)
+        self.assertIn("Someone Else", body)
+        self.assertIn("someone-else@example.com", body)
+
+    def test_a_failed_profile_read_still_saves_the_cookies(self):
+        """Tracking can work when the metadata read did not: the page says so
+        plainly and the credential is kept."""
+        dash = self._makeApp()
+        client = dash.app.test_client()
+        with patch.object(dash, "fetchSpotifyProfile", return_value=None), \
+             patch.object(dash, "get_user_db", return_value=MagicMock()), \
+             patch.object(dash, "is_user_logged_in", return_value=False):
+            response = client.post(
+                "/connect-spotify", data={"cookies": "sp_dc=ok"},
+                headers={"Remote-User": "myrddin"},
+                environ_base={"REMOTE_ADDR": PROXY_PEER})
+            page = client.get("/connect-spotify", headers={"Remote-User": "myrddin"},
+                              environ_base={"REMOTE_ADDR": PROXY_PEER})
+
+        self.assertEqual(response.status_code, 302)
+        self.assertEqual(dash.repo.getUserCookies("myrddin"), {"sp_dc": "ok"})
+        self.assertIsNone(dash.repo.getSpotifyIdentity("myrddin")["email"])
+        body = page.get_data(as_text=True)
+        self.assertIn("did not report which account", body)
+
+    def test_the_cookie_page_saves_a_verified_session_and_returns_to_the_cookie_page(self):
         dash = self._makeApp()
         client = dash.app.test_client()
         saved = MagicMock()
-        with patch.object(dash, "verifyCookiesForEmail", return_value={"sp_dc": "ok"}), \
+        with patch.object(dash, "fetchSpotifyProfile",
+                          return_value={"email": "listening@example.com", "name": None}), \
              patch.object(dash, "get_user_db", return_value=saved), \
              patch.object(dash, "is_user_logged_in", return_value=False):
             response = client.post(
@@ -274,8 +313,10 @@ class TrustedHeaderRequestTestCase(unittest.TestCase):
                 environ_base={"REMOTE_ADDR": PROXY_PEER})
 
         self.assertEqual(response.status_code, 302)
-        self.assertTrue(response.headers["Location"].endswith("/"))
+        self.assertTrue(response.headers["Location"].endswith("/connect-spotify"))
         self.assertEqual(dash.repo.getUserCookies("myrddin"), {"sp_dc": "ok"})
+        self.assertEqual(dash.repo.getSpotifyIdentity("myrddin")["email"],
+                         "listening@example.com")
 
     def test_a_header_session_survives_a_dead_spotify_listener(self):
         """Authentication is the proxy's; a dead listener is not a logout.

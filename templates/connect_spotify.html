@@ -6,6 +6,10 @@
     stored yet - see routes/trusted_header.py. Deliberately the public layout:
     there is no account chrome worth showing before the account has a data
     source, and it keeps this page one form.
+
+    THE TWO IDENTITIES ARE SHOWN AS WHAT THEY ARE. "Signed in as" is the
+    identity provider's answer and stays secondary; the Spotify account is what
+    the page is here to establish, so it is what the success notice names.
 -#}
 {% extends "layout_public.html" %}
 {% block title %}Connect Spotify - {{ super() }}{% endblock %}
@@ -14,16 +18,42 @@
 <div class="login-panel">
   <div class="login-card">
     <h1>Connect Spotify</h1>
+
+    {% if notice %}
+      {% if notice.observed %}
+        <p class="notice" role="status">
+          Connected to Spotify as
+          <strong>{{ notice.name or notice.email or "the account in those cookies" }}</strong>{% if notice.name and notice.email %} ({{ notice.email }}){% endif %}.
+        </p>
+        <p><a class="primary-button" href="{{ url_for('dashboard') }}">Continue to Dashboard</a></p>
+      {% else %}
+        <p class="error" role="status">
+          Cookies saved, but Spotify did not report which account they belong to.
+          Tracking may still work - if it does not, paste fresh cookies below.
+        </p>
+      {% endif %}
+    {% endif %}
+
     <p>
       You are signed in as <strong>{{ email }}</strong> through your identity provider.
       This app reads your listening history from a Spotify web session, so it needs
       that one credential before it can track anything.
     </p>
 
+    {% if spotify_identity and (spotify_identity.email or spotify_identity.name) %}
+      <p>
+        <strong>Spotify account:</strong>
+        {{ spotify_identity.name or spotify_identity.email }}{% if spotify_identity.name and spotify_identity.email %} ({{ spotify_identity.email }}){% endif %}
+      </p>
+    {% elif has_cookies %}
+      <p>The saved Spotify session has not reported its account yet.</p>
+    {% endif %}
+
     {% if has_cookies %}
       <p>
         A Spotify session is already stored. Pasting a new one replaces it - use this
-        after the saved session expires or if tracking has stopped.
+        after the saved session expires, if tracking has stopped, or to track a
+        different Spotify account.
       </p>
     {% endif %}
 
@@ -45,9 +75,9 @@
     {% include "_cookie_instructions.html" %}
 
     <p>
-      The Spotify account's email must match <strong>{{ email }}</strong>. The
-      tracker records under the identity your proxy authenticated, and a session
-      for a different Spotify account is refused rather than mixed into it.
+      The Spotify account does not have to match the address you signed in with.
+      The tracker records under this login, and shows the Spotify account it
+      actually reads in its header and on the account page.
     </p>
   </div>
 </div>
