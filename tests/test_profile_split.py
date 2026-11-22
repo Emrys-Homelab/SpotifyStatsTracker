@@ -213,3 +213,42 @@ class TestCompareLinksToShareManagement(ProfileSplitTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestSpotifyIdentityIsTheHeadline(ProfileSplitTestCase):
+    """The account page names the SPOTIFY account, not the login email.
+
+    The two are decoupled: session["email"] is what the trusted proxy asserted,
+    and users.spotify_account_email/name is whose listening the cookies read.
+    The second is what the user is looking for, so it leads; the first stays
+    visible as secondary context.
+    """
+
+    def test_account_page_leads_with_the_spotify_account(self):
+        client = self._loginAs()
+        self.dash.repo.setSpotifyIdentity("alice", "listening@example.com", "Alice Listening")
+
+        body = client.get("/profile").get_data(as_text=True)
+
+        self.assertIn("Spotify account:", body)
+        self.assertIn("Alice Listening", body)
+        self.assertIn("listening@example.com", body)
+        self.assertIn("Signed in as:", body)
+        self.assertIn("alice@example.com", body)
+        self.assertLess(body.index("Spotify account:"), body.index("Signed in as:"))
+
+    def test_the_nav_names_the_spotify_account(self):
+        client = self._loginAs()
+        self.dash.repo.setSpotifyIdentity("alice", "listening@example.com", None)
+
+        body = client.get("/profile").get_data(as_text=True)
+
+        self.assertIn('class="nav-account-role">Spotify</span> listening@example.com', body)
+
+    def test_without_an_observed_account_the_login_identity_is_the_fallback(self):
+        client = self._loginAs()
+
+        body = client.get("/profile").get_data(as_text=True)
+
+        self.assertIn("not reported yet", body)
+        self.assertIn("alice@example.com", body)

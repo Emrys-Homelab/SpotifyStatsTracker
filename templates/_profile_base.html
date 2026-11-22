@@ -13,10 +13,23 @@
   <div class="login-card profile-card">
     <h1>{% block profileTitle %}User Profile{% endblock %}</h1>
 
+    {#- THE SPOTIFY ACCOUNT IS THE HEADLINE IDENTITY. "Signed in as" is the
+        identity provider's assertion - still visible, deliberately secondary,
+        because with a trusted proxy it is not necessarily whose listening this
+        is. spotify_identity is None until a profile read has named the account
+        (a pre-upgrade row, or a fetch that failed). -#}
     <div class="profile-details">
+      <p>
+        <strong>Spotify account:</strong>
+        {% if spotify_identity and (spotify_identity.email or spotify_identity.name) %}
+          {{ spotify_identity.name or spotify_identity.email }}{% if spotify_identity.name and spotify_identity.email %} ({{ spotify_identity.email }}){% endif %}
+        {% else %}
+          <span class="profile-hint">not reported yet - reconnect Spotify to name it</span>
+        {% endif %}
+      </p>
       <p><strong>Display name:</strong> {{ username | displayName }}{% if isAdmin %} <span class="badge badge-success" title="This account administers the instance">ADMIN</span>{% endif %}</p>
       <p><strong>Username:</strong> {{ username }}</p>
-      <p><strong>Email:</strong> {{ email }}</p>
+      <p><strong>Signed in as:</strong> {{ email }} <span class="profile-hint">(identity provider)</span></p>
     </div>
 
     {% include '_profile_nav.html' %}

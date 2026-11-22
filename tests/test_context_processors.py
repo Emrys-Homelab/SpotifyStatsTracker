@@ -39,13 +39,15 @@ EXPECTED_CONTEXT_KEYS = frozenset({
     "registration_enabled", "share_links_enabled", "artist_bio_enabled",
     "album_bio_enabled", "lastfm_genre_enabled", "tags_enabled",
     "hide_tags_panel",
+    "spotify_identity",
     "hasAcceptedShares", "pendingIncomingSharesCount", "unseenAcceptedShareCount",
     "spotifyNeedsReauthBadge",
     "unseenMilestoneCount", "milestones_enabled",
 })
 
 #< the per-user reads that were hand-rolled `if "x" not in g` memos
-PER_USER_READS = ("isAdmin", "getHideTagsPanel", "getSpotifyNeedsReauth")
+PER_USER_READS = ("isAdmin", "getHideTagsPanel", "getSpotifyNeedsReauth",
+                  "getSpotifyIdentity")
 
 RENDERS_PER_REQUEST = 2   #< two simulated render_template calls in one request
 

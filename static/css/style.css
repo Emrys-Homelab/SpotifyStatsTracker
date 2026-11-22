@@ -2251,6 +2251,23 @@ progress::-moz-progress-bar {
   font-size: 0.9rem;
 }
 
+/* The successful half of the same slot: /connect-spotify reports which Spotify
+   account the saved cookies turned out to be. Same box as .error so the page
+   does not jump between messages, in the accent colour instead of red. */
+.notice {
+  color: var(--text);
+  background: rgba(30, 215, 96, 0.12);
+  border: 1px solid rgba(30, 215, 96, 0.35);
+  padding: 12px 14px;
+  border-radius: 10px;
+  margin-bottom: 1rem;
+  font-size: 0.9rem;
+}
+
+.notice strong {
+  color: var(--text);
+}
+
 .instructions {
   background: rgba(255, 255, 255, 0.04);
   border: 1px solid var(--border);
@@ -3991,6 +4008,15 @@ html.theme-red {
   font-size: 1rem;
 }
 
+/* The nav leads with the Spotify account (see layout.html): the role prefix is
+   what keeps it distinguishable from the login identity at a glance. */
+.nav-account-role {
+  color: var(--accent);
+  font-size: 0.8rem;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
 .nav-item-dropdown:hover .dropdown-trigger,
 .nav-item-dropdown.active-parent .dropdown-trigger {
   color: var(--accent);
@@ -4313,6 +4339,25 @@ html.theme-red {
 
 /* Dashboard live cards (now playing + streak / on this day / discover) - their
    own panel above the filter form + results, since they're filter-independent. */
+/* The dashboard's greeting: the Spotify account leads, the login identity is
+   secondary (see tracks.html). */
+.dashboard-greeting {
+  margin: 0.25rem 0 1rem;
+  color: var(--muted);
+  font-size: 1rem;
+}
+
+.dashboard-greeting strong {
+  color: var(--text);
+  font-family: var(--font-headings);
+  font-size: 1.15rem;
+}
+
+.dashboard-greeting-secondary {
+  color: var(--muted);
+  font-size: 0.85rem;
+}
+
 .dashboard-live {
   /* the page rhythm - this panel is the dashboard's .hero stand-in and
      stacks above the filter card exactly the way a .hero does */

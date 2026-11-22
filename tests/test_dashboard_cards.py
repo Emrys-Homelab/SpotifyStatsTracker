@@ -721,3 +721,30 @@ class DashboardMilestonesCardTestCase(_DashboardHelpers, AppTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class DashboardSpotifyGreetingTestCase(_DashboardHelpers, AppTestCase):
+    """The dashboard greeting names the Spotify account the numbers belong to,
+    not the login identity the proxy asserted."""
+
+    def test_greeting_names_the_spotify_account(self):
+        dash = self._makeApp()
+        dash.repo.upsertUser("alice", "alice@example.com")
+        dash.repo.setSpotifyIdentity("alice", "listening@example.com", "Alice Listening")
+
+        body = self._get(dash, self._makeDb()).data.decode()
+
+        self.assertIn("Listening as", body)
+        self.assertIn("Alice Listening", body)
+        self.assertIn("listening@example.com", body)
+        # the proxy identity stays visible, as secondary context
+        self.assertIn("signed in as alice@example.com", body)
+
+    def test_greeting_falls_back_to_the_login_email_until_a_profile_is_read(self):
+        dash = self._makeApp()
+        dash.repo.upsertUser("alice", "alice@example.com")
+
+        body = self._get(dash, self._makeDb()).data.decode()
+
+        self.assertIn("Listening as", body)
+        self.assertIn("alice@example.com", body)

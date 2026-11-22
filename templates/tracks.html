@@ -8,6 +8,20 @@
      its cards are all h2s, so without this a screen reader's heading list
      opened on "Now playing" with no page title above it. #}
   <h1 class="visually-hidden">Dashboard</h1>
+  {#- THE GREETING NAMES THE SPOTIFY ACCOUNT, not the login identity: the
+      numbers below belong to that account. The proxy's email stays visible as
+      secondary context, and is omitted when it IS the same address. -#}
+  {% set spotifyEmail = (spotify_identity.email if spotify_identity else None) %}
+  {% set spotifyLabel = ((spotify_identity.name or spotify_identity.email) if spotify_identity else None) %}
+  <p class="dashboard-greeting">
+    Listening as <strong>{{ spotifyLabel or session.get('email') or 'you' }}</strong>
+    {%- if spotify_identity and spotify_identity.name and spotifyEmail %}
+      <span class="dashboard-greeting-secondary">({{ spotifyEmail }})</span>
+    {%- endif %}
+    {%- if session.get('email') and (not spotifyEmail or session.get('email')|lower != spotifyEmail|lower) %}
+      <span class="dashboard-greeting-secondary">&middot; signed in as {{ session.get('email') }}</span>
+    {%- endif %}
+  </p>
   {# Live/always-current cards, independent of the interval/date-range filter -
      in their own panel above the form + results. #}
   <section class="dashboard-live">

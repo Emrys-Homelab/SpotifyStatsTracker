@@ -147,7 +147,19 @@
         {% endif %}
         {% set account_active = section in ['profile', 'import', 'admin'] %}
         <div class="nav-item-dropdown nav-account-dropdown {% if account_active %}active-parent{% endif %}">
-          <span class="dropdown-trigger" tabindex="0" role="button" aria-haspopup="true">{{ session.get('username') | displayName or 'Account' }} <span class="chevron">▾</span></span>
+          {#- THE SPOTIFY ACCOUNT LEADS. session["email"] is the login identity
+              (the proxy's assertion); this is the account whose listening the
+              app reads, which is the one a user is looking for. Falls back to
+              the account name only until a profile has been observed. -#}
+          {% set spotifyLabel = (spotify_identity.name or spotify_identity.email) if spotify_identity else None %}
+          <span class="dropdown-trigger" tabindex="0" role="button" aria-haspopup="true"
+                title="{% if spotifyLabel %}Spotify account: {{ spotifyLabel }}{% else %}Account{% endif %}">
+            {%- if spotifyLabel -%}
+              <span class="nav-account-role">Spotify</span> {{ spotifyLabel }}
+            {%- else -%}
+              {{ session.get('username') | displayName or 'Account' }}
+            {%- endif %} <span class="chevron">▾</span>
+          </span>
           <div class="dropdown-content">
             <a class="{{ 'active' if section == 'profile' }}" {% if section == 'profile' %}aria-current="page"{% endif %} href="{{ url_for('profilePage') }}">Profile</a>
             <a class="{{ 'active' if section == 'import' }}" {% if section == 'import' %}aria-current="page"{% endif %} href="{{ url_for('importPage') }}">Import &amp; Export</a>

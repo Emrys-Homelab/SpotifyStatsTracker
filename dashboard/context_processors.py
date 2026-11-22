@@ -99,6 +99,22 @@ def register(app, dashboard) -> None:
             "isAdmin", lambda: dashboard.repo.isAdmin(username) if username else False)}
 
     @app.context_processor
+    def _injectSpotifyIdentity():
+        """The CONNECTED SPOTIFY ACCOUNT, separate from the login identity.
+
+        Behind the trusted proxy, session["email"] is who the proxy let in; this
+        is whose listening the stored cookies read. The UI names this one, and
+        templates fall back to the login identity only while no profile has been
+        observed yet (every pre-upgrade row, and a profile fetch that failed).
+
+        One query per request, memoized on g like the other per-user reads.
+        """
+        username = session.get("username")
+        return {"spotify_identity": _memoized(
+            "spotifyIdentity",
+            lambda: dashboard.repo.getSpotifyIdentity(username) if username else None)}
+
+    @app.context_processor
     def _injectRegistrationStatus():
         # Lets login.html hide its "Create an account" link when the
         # admin has disabled new registrations.
