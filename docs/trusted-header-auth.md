@@ -69,12 +69,23 @@ Spotify listener is built from the cookies stored in `users.cookies_json`, and
 3. If no Spotify session is stored, every page redirects to
    **`/connect-spotify`**. That page carries the same "locate your session
    data" instructions as the login page and saves the pasted cookies.
-4. Cookies are verified exactly as the standalone login verifies them: they
-   must authenticate to Spotify **and** the Spotify account's email must match
-   the trusted email. A session for a different Spotify account is refused —
-   the listener would otherwise detect contamination and record nothing.
+4. The cookies are **not** checked against the trusted email. The login
+   identity and the Spotify account are decoupled: the proxy decides who may
+   use the app, and the cookies decide whose listening is tracked. The page
+   reads the Spotify profile, records it on the user row
+   (`users.spotify_account_email` / `spotify_account_name`) and reports
+   "Connected to Spotify as …". A different Spotify account is the normal
+   case, not a refusal. If the profile read fails the cookies are still saved
+   and the page says the account could not be named — tracking often works
+   even when the metadata call did not.
 5. From then on the SSO login is the only prompt; the Spotify cookies are a
    stored data-source credential, not a login.
+
+The identity the UI shows is the Spotify one — the header, the account page
+and the dashboard greeting name that account, with the SSO identity kept as
+secondary context. A **change** of Spotify account mid-session is still
+noticed: the listener logs a warning, rebaselines, records the new account
+and keeps recording. It is an annotation, not a refusal.
 
 If the Spotify session later expires, tracking pauses (the app's normal
 behaviour) and `/connect-spotify` is where it is replaced. The page is
