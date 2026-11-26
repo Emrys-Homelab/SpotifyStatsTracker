@@ -1,0 +1,304 @@
+From f9188f56455fbc4c8cabd251c052a4dd6dd35b06 Mon Sep 17 00:00:00 2001
+From: homelab-admin <homelab-admin@homelab>
+Date: Sun, 22 Nov 2026 19:20:36 +0000
+Subject: [PATCH 08/10] ui: show the Spotify account instead of the login email
+
+The login identity is now "who may use the app"; the Spotify account is
+"whose listening is tracked", and in an SSO setup that is the one the user
+cares about. A request-scoped context processor exposes the observed identity,
+and the nav trigger, the account page and the dashboard greeting all lead with
+it, labelled "Spotify account". The proxy's email stays visible as secondary
+context ("Signed in as") and is the fallback until a profile has been read.
+---
+ dashboard/context_processors.py  | 16 ++++++++++++
+ static/css/style.css             | 45 ++++++++++++++++++++++++++++++++
+ templates/_profile_base.html     | 15 ++++++++++-
+ templates/layout.html            | 14 +++++++++-
+ templates/tracks.html            | 14 ++++++++++
+ tests/test_context_processors.py |  4 ++-
+ tests/test_dashboard_cards.py    | 27 +++++++++++++++++++
+ tests/test_profile_split.py      | 39 +++++++++++++++++++++++++++
+ 8 files changed, 171 insertions(+), 3 deletions(-)
+
+diff --git a/dashboard/context_processors.py b/dashboard/context_processors.py
+index 6310825..dc911c1 100644
+--- a/dashboard/context_processors.py
++++ b/dashboard/context_processors.py
+@@ -98,6 +98,22 @@ def register(app, dashboard) -> None:
+         return {"isAdmin": _memoized(
+             "isAdmin", lambda: dashboard.repo.isAdmin(username) if username else False)}
+ 
++    @app.context_processor
++    def _injectSpotifyIdentity():
++        """The CONNECTED SPOTIFY ACCOUNT, separate from the login identity.
++
++        Behind the trusted proxy, session["email"] is who the proxy let in; this
++        is whose listening the stored cookies read. The UI names this one, and
++        templates fall back to the login identity only while no profile has been
++        observed yet (every pre-upgrade row, and a profile fetch that failed).
++
++        One query per request, memoized on g like the other per-user reads.
++        """
++        username = session.get("username")
++        return {"spotify_identity": _memoized(
++            "spotifyIdentity",
++            lambda: dashboard.repo.getSpotifyIdentity(username) if username else None)}
++
+     @app.context_processor
+     def _injectRegistrationStatus():
+         # Lets login.html hide its "Create an account" link when the
+diff --git a/static/css/style.css b/static/css/style.css
+index dd0f3b4..3ddb7fd 100644
+--- a/static/css/style.css
++++ b/static/css/style.css
+@@ -2251,6 +2251,23 @@ progress::-moz-progress-bar {
+   font-size: 0.9rem;
+ }
+ 
++/* The successful half of the same slot: /connect-spotify reports which Spotify
++   account the saved cookies turned out to be. Same box as .error so the page
++   does not jump between messages, in the accent colour instead of red. */
++.notice {
++  color: var(--text);
++  background: rgba(30, 215, 96, 0.12);
++  border: 1px solid rgba(30, 215, 96, 0.35);
++  padding: 12px 14px;
++  border-radius: 10px;
++  margin-bottom: 1rem;
++  font-size: 0.9rem;
++}
++
++.notice strong {
++  color: var(--text);
++}
++
+ .instructions {
+   background: rgba(255, 255, 255, 0.04);
+   border: 1px solid var(--border);
+@@ -3991,6 +4008,15 @@ html.theme-red {
+   font-size: 1rem;
+ }
+ 
++/* The nav leads with the Spotify account (see layout.html): the role prefix is
++   what keeps it distinguishable from the login identity at a glance. */
++.nav-account-role {
++  color: var(--accent);
++  font-size: 0.8rem;
++  letter-spacing: 0.04em;
++  text-transform: uppercase;
++}
++
+ .nav-item-dropdown:hover .dropdown-trigger,
+ .nav-item-dropdown.active-parent .dropdown-trigger {
+   color: var(--accent);
+@@ -4313,6 +4339,25 @@ html.theme-red {
+ 
+ /* Dashboard live cards (now playing + streak / on this day / discover) - their
+    own panel above the filter form + results, since they're filter-independent. */
++/* The dashboard's greeting: the Spotify account leads, the login identity is
++   secondary (see tracks.html). */
++.dashboard-greeting {
++  margin: 0.25rem 0 1rem;
++  color: var(--muted);
++  font-size: 1rem;
++}
++
++.dashboard-greeting strong {
++  color: var(--text);
++  font-family: var(--font-headings);
++  font-size: 1.15rem;
++}
++
++.dashboard-greeting-secondary {
++  color: var(--muted);
++  font-size: 0.85rem;
++}
++
+ .dashboard-live {
+   /* the page rhythm - this panel is the dashboard's .hero stand-in and
+      stacks above the filter card exactly the way a .hero does */
+diff --git a/templates/_profile_base.html b/templates/_profile_base.html
+index a3ed5ef..7c6dfb6 100644
+--- a/templates/_profile_base.html
++++ b/templates/_profile_base.html
+@@ -13,10 +13,23 @@
+   <div class="login-card profile-card">
+     <h1>{% block profileTitle %}User Profile{% endblock %}</h1>
+ 
++    {#- THE SPOTIFY ACCOUNT IS THE HEADLINE IDENTITY. "Signed in as" is the
++        identity provider's assertion - still visible, deliberately secondary,
++        because with a trusted proxy it is not necessarily whose listening this
++        is. spotify_identity is None until a profile read has named the account
++        (a pre-upgrade row, or a fetch that failed). -#}
+     <div class="profile-details">
++      <p>
++        <strong>Spotify account:</strong>
++        {% if spotify_identity and (spotify_identity.email or spotify_identity.name) %}
++          {{ spotify_identity.name or spotify_identity.email }}{% if spotify_identity.name and spotify_identity.email %} ({{ spotify_identity.email }}){% endif %}
++        {% else %}
++          <span class="profile-hint">not reported yet - reconnect Spotify to name it</span>
++        {% endif %}
++      </p>
+       <p><strong>Display name:</strong> {{ username | displayName }}{% if isAdmin %} <span class="badge badge-success" title="This account administers the instance">ADMIN</span>{% endif %}</p>
+       <p><strong>Username:</strong> {{ username }}</p>
+-      <p><strong>Email:</strong> {{ email }}</p>
++      <p><strong>Signed in as:</strong> {{ email }} <span class="profile-hint">(identity provider)</span></p>
+     </div>
+ 
+     {% include '_profile_nav.html' %}
+diff --git a/templates/layout.html b/templates/layout.html
+index 8b29152..efb659d 100644
+--- a/templates/layout.html
++++ b/templates/layout.html
+@@ -147,7 +147,19 @@
+         {% endif %}
+         {% set account_active = section in ['profile', 'import', 'admin'] %}
+         <div class="nav-item-dropdown nav-account-dropdown {% if account_active %}active-parent{% endif %}">
+-          <span class="dropdown-trigger" tabindex="0" role="button" aria-haspopup="true">{{ session.get('username') | displayName or 'Account' }} <span class="chevron">▾</span></span>
++          {#- THE SPOTIFY ACCOUNT LEADS. session["email"] is the login identity
++              (the proxy's assertion); this is the account whose listening the
++              app reads, which is the one a user is looking for. Falls back to
++              the account name only until a profile has been observed. -#}
++          {% set spotifyLabel = (spotify_identity.name or spotify_identity.email) if spotify_identity else None %}
++          <span class="dropdown-trigger" tabindex="0" role="button" aria-haspopup="true"
++                title="{% if spotifyLabel %}Spotify account: {{ spotifyLabel }}{% else %}Account{% endif %}">
++            {%- if spotifyLabel -%}
++              <span class="nav-account-role">Spotify</span> {{ spotifyLabel }}
++            {%- else -%}
++              {{ session.get('username') | displayName or 'Account' }}
++            {%- endif %} <span class="chevron">▾</span>
++          </span>
+           <div class="dropdown-content">
+             <a class="{{ 'active' if section == 'profile' }}" {% if section == 'profile' %}aria-current="page"{% endif %} href="{{ url_for('profilePage') }}">Profile</a>
+             <a class="{{ 'active' if section == 'import' }}" {% if section == 'import' %}aria-current="page"{% endif %} href="{{ url_for('importPage') }}">Import &amp; Export</a>
+diff --git a/templates/tracks.html b/templates/tracks.html
+index f5afcd1..4f672af 100644
+--- a/templates/tracks.html
++++ b/templates/tracks.html
+@@ -8,6 +8,20 @@
+      its cards are all h2s, so without this a screen reader's heading list
+      opened on "Now playing" with no page title above it. #}
+   <h1 class="visually-hidden">Dashboard</h1>
++  {#- THE GREETING NAMES THE SPOTIFY ACCOUNT, not the login identity: the
++      numbers below belong to that account. The proxy's email stays visible as
++      secondary context, and is omitted when it IS the same address. -#}
++  {% set spotifyEmail = (spotify_identity.email if spotify_identity else None) %}
++  {% set spotifyLabel = ((spotify_identity.name or spotify_identity.email) if spotify_identity else None) %}
++  <p class="dashboard-greeting">
++    Listening as <strong>{{ spotifyLabel or session.get('email') or 'you' }}</strong>
++    {%- if spotify_identity and spotify_identity.name and spotifyEmail %}
++      <span class="dashboard-greeting-secondary">({{ spotifyEmail }})</span>
++    {%- endif %}
++    {%- if session.get('email') and (not spotifyEmail or session.get('email')|lower != spotifyEmail|lower) %}
++      <span class="dashboard-greeting-secondary">&middot; signed in as {{ session.get('email') }}</span>
++    {%- endif %}
++  </p>
+   {# Live/always-current cards, independent of the interval/date-range filter -
+      in their own panel above the form + results. #}
+   <section class="dashboard-live">
+diff --git a/tests/test_context_processors.py b/tests/test_context_processors.py
+index f5d6d31..d76c5ad 100644
+--- a/tests/test_context_processors.py
++++ b/tests/test_context_processors.py
+@@ -39,13 +39,15 @@ EXPECTED_CONTEXT_KEYS = frozenset({
+     "registration_enabled", "share_links_enabled", "artist_bio_enabled",
+     "album_bio_enabled", "lastfm_genre_enabled", "tags_enabled",
+     "hide_tags_panel",
++    "spotify_identity",
+     "hasAcceptedShares", "pendingIncomingSharesCount", "unseenAcceptedShareCount",
+     "spotifyNeedsReauthBadge",
+     "unseenMilestoneCount", "milestones_enabled",
+ })
+ 
+ #< the per-user reads that were hand-rolled `if "x" not in g` memos
+-PER_USER_READS = ("isAdmin", "getHideTagsPanel", "getSpotifyNeedsReauth")
++PER_USER_READS = ("isAdmin", "getHideTagsPanel", "getSpotifyNeedsReauth",
++                  "getSpotifyIdentity")
+ 
+ RENDERS_PER_REQUEST = 2   #< two simulated render_template calls in one request
+ 
+diff --git a/tests/test_dashboard_cards.py b/tests/test_dashboard_cards.py
+index 0b8c174..a51fe61 100644
+--- a/tests/test_dashboard_cards.py
++++ b/tests/test_dashboard_cards.py
+@@ -721,3 +721,30 @@ class DashboardMilestonesCardTestCase(_DashboardHelpers, AppTestCase):
+ 
+ if __name__ == "__main__":
+     unittest.main()
++
++
++class DashboardSpotifyGreetingTestCase(_DashboardHelpers, AppTestCase):
++    """The dashboard greeting names the Spotify account the numbers belong to,
++    not the login identity the proxy asserted."""
++
++    def test_greeting_names_the_spotify_account(self):
++        dash = self._makeApp()
++        dash.repo.upsertUser("alice", "alice@example.com")
++        dash.repo.setSpotifyIdentity("alice", "listening@example.com", "Alice Listening")
++
++        body = self._get(dash, self._makeDb()).data.decode()
++
++        self.assertIn("Listening as", body)
++        self.assertIn("Alice Listening", body)
++        self.assertIn("listening@example.com", body)
++        # the proxy identity stays visible, as secondary context
++        self.assertIn("signed in as alice@example.com", body)
++
++    def test_greeting_falls_back_to_the_login_email_until_a_profile_is_read(self):
++        dash = self._makeApp()
++        dash.repo.upsertUser("alice", "alice@example.com")
++
++        body = self._get(dash, self._makeDb()).data.decode()
++
++        self.assertIn("Listening as", body)
++        self.assertIn("alice@example.com", body)
+diff --git a/tests/test_profile_split.py b/tests/test_profile_split.py
+index 6719d4f..8c4a9a8 100644
+--- a/tests/test_profile_split.py
++++ b/tests/test_profile_split.py
+@@ -213,3 +213,42 @@ class TestCompareLinksToShareManagement(ProfileSplitTestCase):
+ 
+ if __name__ == "__main__":
+     unittest.main()
++
++
++class TestSpotifyIdentityIsTheHeadline(ProfileSplitTestCase):
++    """The account page names the SPOTIFY account, not the login email.
++
++    The two are decoupled: session["email"] is what the trusted proxy asserted,
++    and users.spotify_account_email/name is whose listening the cookies read.
++    The second is what the user is looking for, so it leads; the first stays
++    visible as secondary context.
++    """
++
++    def test_account_page_leads_with_the_spotify_account(self):
++        client = self._loginAs()
++        self.dash.repo.setSpotifyIdentity("alice", "listening@example.com", "Alice Listening")
++
++        body = client.get("/profile").get_data(as_text=True)
++
++        self.assertIn("Spotify account:", body)
++        self.assertIn("Alice Listening", body)
++        self.assertIn("listening@example.com", body)
++        self.assertIn("Signed in as:", body)
++        self.assertIn("alice@example.com", body)
++        self.assertLess(body.index("Spotify account:"), body.index("Signed in as:"))
++
++    def test_the_nav_names_the_spotify_account(self):
++        client = self._loginAs()
++        self.dash.repo.setSpotifyIdentity("alice", "listening@example.com", None)
++
++        body = client.get("/profile").get_data(as_text=True)
++
++        self.assertIn('class="nav-account-role">Spotify</span> listening@example.com', body)
++
++    def test_without_an_observed_account_the_login_identity_is_the_fallback(self):
++        client = self._loginAs()
++
++        body = client.get("/profile").get_data(as_text=True)
++
++        self.assertIn("not reported yet", body)
++        self.assertIn("alice@example.com", body)
+-- 
+2.47.3
+

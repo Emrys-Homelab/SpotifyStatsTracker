@@ -1,0 +1,459 @@
+From 0d2f9dce416a1553bc9fdef406e76706ef698f63 Mon Sep 17 00:00:00 2001
+From: homelab-admin <homelab-admin@homelab>
+Date: Sun, 22 Nov 2026 19:20:23 +0000
+Subject: [PATCH 06/10] auth: accept /connect-spotify cookies whatever the
+ account email
+
+The trusted proxy decides who may use the app; the cookies decide whose
+listening is tracked. In a one-user SSO deployment those are routinely
+different accounts, and the old ownership check made the decoupling pointless:
+mismatched cookies were refused, so nothing was ever recorded.
+
+/connect-spotify now accepts the cookies, reads the Spotify profile, records
+the reported email/display name on the user row and reports "Connected to
+Spotify as <account>" with a way to replace the cookies. A failed profile read
+is reported plainly and the cookies are still saved - tracking often works
+even when the metadata call did not. The standalone login/register/reset
+forms keep verifyCookiesForEmail: there the cookies ARE the credential, and
+accepting a mismatched pair would hand one user's database to anyone who knew
+their email. Trusted-header auth and its TRUSTED_PROXY_CIDRS peer check are
+unchanged.
+---
+ app.py                            | 107 +++++++++++++++++++++---------
+ routes/trusted_header.py          |  76 ++++++++++++++++-----
+ templates/connect_spotify.html    |  38 +++++++++--
+ tests/test_trusted_header_auth.py |  55 +++++++++++++--
+ 4 files changed, 217 insertions(+), 59 deletions(-)
+
+diff --git a/app.py b/app.py
+index 9dfb139..17c9634 100644
+--- a/app.py
++++ b/app.py
+@@ -444,52 +444,96 @@ class SpotifyDashboardApp(ViewModelMixin, PaginationMixin, DateRangeMixin, Wrapp
+         if promoted:
+             logger.info("Promoted earliest-created user %s to admin (no admin existed yet)", promoted)
+ 
+-    def _verifyCookiesMatchEmail(self, cookies: dict, email: str) -> bool:
+-        """Check that the submitted Spotify cookies actually belong to `email` by
+-        fetching the account profile with them. The cookies are written to a
+-        throwaway session file so an unverified login attempt can never overwrite
+-        another user's stored cookies. Without this check, anyone could claim any
+-        email at login and be handed that user's database."""
+-        if not cookies or not email:
+-            return False
++    def fetchSpotifyProfile(self, cookies: dict) -> dict | None:
++        """Ask Spotify whose cookies these are: {"email", "name", "id"} or None.
++
++        This answers a DIFFERENT question from ``verifyCookiesForEmail``: not
++        "may this person use the app" (the trusted proxy or the password form
++        answers that) but "whose listening would this session read". It is the
++        source of the Spotify identity shown in the UI, and it is deliberately
++        not a gate - a profile fetch that fails (a bot-check page, a rate limit,
++        a transport failure) returns None and the caller stores the cookies
++        anyway, because tracking frequently works even when the metadata read
++        did not.
++
++        The cookies go to a THROWAWAY session file, so an attempt that cannot
++        be identified never touches the account's stored cookies, and the
++        session is closed afterwards: every login builds its own TLS client,
++        each of which is atexit-pinned until the process exits.
++        """
++        if not cookies:
++            return None
+ 
+-        tmpFd, tmpPath = tempfile.mkstemp(prefix="verify_cookies_", suffix=".json")
++        tmpFd, tmpPath = tempfile.mkstemp(prefix="spotify_profile_", suffix=".json")
+         os.close(tmpFd)
+         sp = None
+         try:
+-            saveSession(cookies, email, tmpPath)
++            # A non-empty synthetic identifier: Spotify.login() resolves the
++            # session by identifier, and an empty string is falsy there.
++            saveSession(cookies, "spotify-profile-lookup", tmpPath)
+             with _suppress_signal_in_thread():
+-                sp = Spotify(cookiesFile=tmpPath, email=email)
++                sp = Spotify(cookiesFile=tmpPath, email="spotify-profile-lookup")
+             if not sp.isLoggedIn():
+-                return False
++                return None
+             profile = sp.current_user() or {}
+-            profileEmail = (profile.get("email") or "").strip().lower()
+-            return profileEmail == email.strip().lower()
++            email = (profile.get("email") or "").strip() or None
++            name = (profile.get("display_name") or "").strip() or None
++            return {"email": email, "name": name, "id": profile.get("id")}
+         except Exception as e:
+-            logger.warning("Cookie verification failed for %s: %s", email, e)
+-            return False
++            logger.warning("Spotify profile lookup failed (cookies kept anyway): %s", e)
++            return None
+         finally:
+             if sp is not None:
+-                # This login built its own TLS client, and every one of those
+-                # is atexit-pinned until the process exits - so a session left
+-                # open here accumulated one per login/register/reset attempt.
+                 sp.close()
+             try:
+                 os.unlink(tmpPath)
+             except OSError:
+                 pass
+ 
++    def recordSpotifyIdentity(self, username: str, profile: dict | None) -> None:
++        """Persist the observed Spotify account on the user row.
++
++        A no-op when the profile is None (nothing was learned) or when the
++        values already match - the repo's UPDATE has the same guard, but
++        skipping the call here keeps a listener's per-rebuild callback from
++        touching the database at all in the common case.
++        """
++        if not profile:
++            return
++        try:
++            self.repo.setSpotifyIdentity(username, profile.get("email"), profile.get("name"))
++        except Exception as e:
++            # Cosmetic state only: failing to record the label must never fail
++            # a login or stop a listener that is otherwise recording plays.
++            logger.warning("Could not record the Spotify identity for %s: %s", username, e)
++
++    def _verifyCookiesMatchEmail(self, cookies: dict, email: str) -> bool:
++        """Check that the submitted Spotify cookies actually belong to `email`.
++
++        Kept for the three STANDALONE doors (login/register/reset-password),
++        where the cookies are the credential and the email is the account key -
++        accepting a mismatched pair there would hand one user's database to
++        anyone who knew their email. The trusted-header /connect-spotify page
++        deliberately does NOT use this: there the proxy has already decided who
++        may log in, and the Spotify account is allowed to be a different one.
++        """
++        if not cookies or not email:
++            return False
++        profile = self.fetchSpotifyProfile(cookies)
++        if profile is None:
++            return False
++        profileEmail = (profile.get("email") or "").strip().lower()
++        return profileEmail == email.strip().lower()
++
+     def verifyCookiesForEmail(self, cookies: str, email: str):
+         """The parsed cookies, or None when they don't provably belong to `email`.
+ 
+-        One implementation for every door that accepts Spotify cookies: the
+-        three standalone forms (login/register/reset-password, through
+-        routes/auth.py's _verifiedCookies) and the trusted-header
+-        /connect-spotify page. They must ask the same question - the per-user
+-        Listener refuses to record a session whose Spotify email differs from
+-        the account's email (see spotifyListener._captureIdentityBaseline), so
+-        accepting a mismatched session here would store a credential that can
+-        never track.
++        The standalone forms' ownership check (see routes/auth.py's
++        _verifiedCookies). The trusted-header /connect-spotify page used to
++        share it; it no longer does, because in a one-user SSO deployment the
++        login email and the Spotify account are separate things and a
++        mismatch is the normal case, not a contamination (see
++        routes/trusted_header.py).
+ 
+         SKIP_EMAIL_VERIFICATION remains the explicit, instance-wide opt-out of
+         the ownership check (see config.py); it is deliberately unchanged.
+@@ -759,12 +803,15 @@ class SpotifyDashboardApp(ViewModelMixin, PaginationMixin, DateRangeMixin, Wrapp
+             try:
+                 db = self.get_user_db(username, email)
+                 # If listener has crashed, marked DEAD, or its thread has stopped, restart it -
+-                # UNLESS the last start failed on definitively bad/mismatched cookies. Those
+-                # never recover by retrying (every restart re-attempts the same failing Spotify
++                # UNLESS the last start failed on definitively bad cookies. Those never
++                # recover by retrying (every restart re-attempts the same failing Spotify
+                 # login, risking bot-detection/rate-limit escalation); only a fresh re-login
+                 # (which rebuilds the listener via _refresh_user_session) should retry them.
++                # A DIFFERENT Spotify account is no longer in this set: the login identity
++                # and the tracked account are decoupled, so a mismatch is not a credential
++                # failure (see Listener._captureIdentityBaseline).
+                 listener = db.listener
+-                credentialFailure = listener is not None and (listener.loginFailed or listener.contaminationDetected)
++                credentialFailure = listener is not None and listener.loginFailed
+                 needsRestart = db.getListenerHealth()["status"] == "DEAD" or not (
+                     listener and listener.thread and listener.thread.is_alive()
+                 )
+diff --git a/routes/trusted_header.py b/routes/trusted_header.py
+index c87bb3a..c0bf765 100644
+--- a/routes/trusted_header.py
++++ b/routes/trusted_header.py
+@@ -19,9 +19,17 @@ module adds on top of it:
+   to log in but NOT to track: ``is_user_logged_in()`` is False while
+   ``users.cookies_json`` is NULL, and the per-user listener that records plays
+   is built from those cookies. The cookie page is where that one remaining
+-  credential is supplied, and the ownership check is the same one the
+-  standalone forms use - the Spotify account's email must match the trusted
+-  email, or the listener would (correctly) refuse to record as contamination.
++  credential is supplied.
++
++THE TWO IDENTITIES ARE DELIBERATELY DECOUPLED. The proxy decides who may use
++the app (``users.email``); the cookies decide whose listening is tracked
++(``users.spotify_account_email`` / ``spotify_account_name``). They are allowed
++to be different people's, and in a one-user SSO deployment that is the normal
++case, not a mistake. ``/connect-spotify`` therefore does NOT verify the cookies
++against the account email the way the standalone login/register/reset forms
++still do: it accepts them, asks Spotify who they are, records that answer, and
++says so on the page. A failed profile read is reported plainly and the cookies
++are still saved - tracking often works even when the metadata call did not.
+ 
+ The refusal branches are deliberately NOT redirects to the login form:
+ an untrusted peer, or a missing identity header, is a misconfiguration or an
+@@ -32,8 +40,8 @@ import logging
+ 
+ from flask import Response, abort, redirect, render_template, request, session, url_for
+ 
++from Database.Spotify.cookies import parseCookieString
+ from config import SESSION_VERSION_KEY, TRUSTED_HEADER_SESSION_KEY
+-from routes.auth import COOKIE_OWNERSHIP_ERROR
+ from services.trusted_header import (
+     identityFromHeaders,
+     isTrustedPeer,
+@@ -42,6 +50,10 @@ from services.trusted_header import (
+ 
+ logger = logging.getLogger(__name__)
+ 
++# One-shot result of the last POST, popped on the redirect that follows it -
++# the page is rendered by a GET so a refresh does not re-save the cookies.
++CONNECT_NOTICE_KEY = "connect_spotify_notice"
++
+ # Routes that must keep working without an identity header. /health is the
+ # kubelet's probe (its peer is the node, never the proxy) and static assets
+ # carry no account data; refusing either would break the pod or make a refusal
+@@ -153,7 +165,13 @@ def register(app, dashboard) -> None:
+ 
+     @app.route("/connect-spotify", methods=["GET", "POST"])
+     def connectSpotify():
+-        """Supply the one credential the SSO proxy cannot: a Spotify session."""
++        """Supply the one credential the SSO proxy cannot: a Spotify session.
++
++        It answers "whose listening should be tracked?", not "who are you?" -
++        the proxy already answered the second. So the cookies are not checked
++        against the signed-in email; they are SAVED, and the profile read below
++        names the account they actually belong to.
++        """
+         email = session.get("email")
+         if not email or session.get(TRUSTED_HEADER_SESSION_KEY) is not True:
+             abort(403)
+@@ -164,28 +182,50 @@ def register(app, dashboard) -> None:
+         error = None
+         if request.method == "POST":
+             cookies = request.form.get("cookies", "").strip()
+-            if not cookies:
+-                error = "Paste the cookies from your Spotify session."
++            parsed = parseCookieString(cookies)
++            if not parsed:
++                error = ("Paste the cookies from your Spotify session - that text "
++                         "did not contain any cookies.")
+             else:
+-                parsed = dashboard.verifyCookiesForEmail(cookies, email)
+-                if parsed is None:
+-                    error = COOKIE_OWNERSHIP_ERROR.format(email=email)
+-                else:
+-                    dashboard.repo.setUserCookies(username, parsed)
+-                    # A user who re-connects after an expiry already has a
+-                    # Database (and a dead listener); a first login does not.
+-                    # Both paths must leave a listener built from the NEW
+-                    # cookies and no stale login-status cache.
+-                    dashboard._invalidateLoginCache(email)
++                # THE PROFILE READ IS THE POINT, NOT A GATE. It returns None on
++                # a bot-check page, a rate limit or a transport failure, and
++                # the cookies are stored regardless: tracking may well work
++                # even when the label could not be read.
++                profile = dashboard.fetchSpotifyProfile(parsed)
++                dashboard.repo.setUserCookies(username, parsed)
++                if profile:
++                    dashboard.recordSpotifyIdentity(username, profile)
++
++                session[CONNECT_NOTICE_KEY] = {
++                    "email": (profile or {}).get("email"),
++                    "name": (profile or {}).get("name"),
++                    "observed": profile is not None,
++                }
++
++                # A user who re-connects after an expiry already has a
++                # Database (and a dead listener); a first login does not.
++                # Both paths must leave a listener built from the NEW
++                # cookies and no stale login-status cache. A listener that
++                # cannot start is reported in the app (health DEAD) - it must
++                # not turn "cookies saved" into a 500.
++                dashboard._invalidateLoginCache(email)
++                try:
+                     if username in dashboard.user_databases:
+                         dashboard._refresh_user_session(username, email)
+                     else:
+                         dashboard.get_user_db(username, email)
+-                    return redirect(url_for("dashboard"))
++                except Exception as e:
++                    logger.error(
++                        "Spotify session saved for %s, but its listener could not be started: %s",
++                        username, e)
++
++                return redirect(url_for("connectSpotify"))
+ 
++        notice = session.pop(CONNECT_NOTICE_KEY, None)
+         return render_template(
+             "connect_spotify.html",
+             email=email,
+             error=error,
++            notice=notice,
+             has_cookies=dashboard.repo.getUserCookies(username) is not None,
+         )
+diff --git a/templates/connect_spotify.html b/templates/connect_spotify.html
+index ea27afc..749ac5e 100644
+--- a/templates/connect_spotify.html
++++ b/templates/connect_spotify.html
+@@ -6,6 +6,10 @@
+     stored yet - see routes/trusted_header.py. Deliberately the public layout:
+     there is no account chrome worth showing before the account has a data
+     source, and it keeps this page one form.
++
++    THE TWO IDENTITIES ARE SHOWN AS WHAT THEY ARE. "Signed in as" is the
++    identity provider's answer and stays secondary; the Spotify account is what
++    the page is here to establish, so it is what the success notice names.
+ -#}
+ {% extends "layout_public.html" %}
+ {% block title %}Connect Spotify - {{ super() }}{% endblock %}
+@@ -14,16 +18,42 @@
+ <div class="login-panel">
+   <div class="login-card">
+     <h1>Connect Spotify</h1>
++
++    {% if notice %}
++      {% if notice.observed %}
++        <p class="notice" role="status">
++          Connected to Spotify as
++          <strong>{{ notice.name or notice.email or "the account in those cookies" }}</strong>{% if notice.name and notice.email %} ({{ notice.email }}){% endif %}.
++        </p>
++        <p><a class="primary-button" href="{{ url_for('dashboard') }}">Continue to Dashboard</a></p>
++      {% else %}
++        <p class="error" role="status">
++          Cookies saved, but Spotify did not report which account they belong to.
++          Tracking may still work - if it does not, paste fresh cookies below.
++        </p>
++      {% endif %}
++    {% endif %}
++
+     <p>
+       You are signed in as <strong>{{ email }}</strong> through your identity provider.
+       This app reads your listening history from a Spotify web session, so it needs
+       that one credential before it can track anything.
+     </p>
+ 
++    {% if spotify_identity and (spotify_identity.email or spotify_identity.name) %}
++      <p>
++        <strong>Spotify account:</strong>
++        {{ spotify_identity.name or spotify_identity.email }}{% if spotify_identity.name and spotify_identity.email %} ({{ spotify_identity.email }}){% endif %}
++      </p>
++    {% elif has_cookies %}
++      <p>The saved Spotify session has not reported its account yet.</p>
++    {% endif %}
++
+     {% if has_cookies %}
+       <p>
+         A Spotify session is already stored. Pasting a new one replaces it - use this
+-        after the saved session expires or if tracking has stopped.
++        after the saved session expires, if tracking has stopped, or to track a
++        different Spotify account.
+       </p>
+     {% endif %}
+ 
+@@ -45,9 +75,9 @@
+     {% include "_cookie_instructions.html" %}
+ 
+     <p>
+-      The Spotify account's email must match <strong>{{ email }}</strong>. The
+-      tracker records under the identity your proxy authenticated, and a session
+-      for a different Spotify account is refused rather than mixed into it.
++      The Spotify account does not have to match the address you signed in with.
++      The tracker records under this login, and shows the Spotify account it
++      actually reads in its header and on the account page.
+     </p>
+   </div>
+ </div>
+diff --git a/tests/test_trusted_header_auth.py b/tests/test_trusted_header_auth.py
+index 723c48c..d4f3992 100644
+--- a/tests/test_trusted_header_auth.py
++++ b/tests/test_trusted_header_auth.py
+@@ -249,23 +249,62 @@ class TrustedHeaderRequestTestCase(unittest.TestCase):
+         self.assertIn("Connect Spotify", body)
+         self.assertIn("How to locate your session data", body)
+ 
+-    def test_the_cookie_page_rejects_cookies_that_are_not_this_accounts(self):
++    def test_cookies_for_a_different_spotify_account_are_accepted_and_named(self):
++        """The decoupling, end to end: the login identity is the proxy's, and
++        the cookies may belong to a different Spotify account. They are saved,
++        the profile read names the account, and the page says so."""
+         dash = self._makeApp()
+         client = dash.app.test_client()
+-        with patch.object(dash, "verifyCookiesForEmail", return_value=None):
++        profile = {"email": "someone-else@example.com", "name": "Someone Else"}
++        with patch.object(dash, "fetchSpotifyProfile", return_value=profile), \
++             patch.object(dash, "get_user_db", return_value=MagicMock()), \
++             patch.object(dash, "is_user_logged_in", return_value=False):
+             response = client.post(
+                 "/connect-spotify", data={"cookies": "sp_dc=someone-else"},
+                 headers={"Remote-User": "myrddin"},
+                 environ_base={"REMOTE_ADDR": PROXY_PEER})
++            self.assertEqual(response.status_code, 302)
++            self.assertTrue(response.headers["Location"].endswith("/connect-spotify"))
++
++            # Follow the redirect: the page reports what it found.
++            page = client.get("/connect-spotify", headers={"Remote-User": "myrddin"},
++                              environ_base={"REMOTE_ADDR": PROXY_PEER})
++
++        self.assertEqual(dash.repo.getUserCookies("myrddin"), {"sp_dc": "someone-else"})
++        self.assertEqual(dash.repo.getSpotifyIdentity("myrddin"),
++                         {"email": "someone-else@example.com", "name": "Someone Else"})
++        body = page.get_data(as_text=True)
++        self.assertIn("Connected to Spotify as", body)
++        self.assertIn("Someone Else", body)
++        self.assertIn("someone-else@example.com", body)
++
++    def test_a_failed_profile_read_still_saves_the_cookies(self):
++        """Tracking can work when the metadata read did not: the page says so
++        plainly and the credential is kept."""
++        dash = self._makeApp()
++        client = dash.app.test_client()
++        with patch.object(dash, "fetchSpotifyProfile", return_value=None), \
++             patch.object(dash, "get_user_db", return_value=MagicMock()), \
++             patch.object(dash, "is_user_logged_in", return_value=False):
++            response = client.post(
++                "/connect-spotify", data={"cookies": "sp_dc=ok"},
++                headers={"Remote-User": "myrddin"},
++                environ_base={"REMOTE_ADDR": PROXY_PEER})
++            page = client.get("/connect-spotify", headers={"Remote-User": "myrddin"},
++                              environ_base={"REMOTE_ADDR": PROXY_PEER})
+ 
+-        self.assertEqual(response.status_code, 200)
+-        self.assertIn("Couldn&#39;t verify", response.get_data(as_text=True))
++        self.assertEqual(response.status_code, 302)
++        self.assertEqual(dash.repo.getUserCookies("myrddin"), {"sp_dc": "ok"})
++        self.assertIsNone(dash.repo.getSpotifyIdentity("myrddin")["email"])
++        body = page.get_data(as_text=True)
++        self.assertIn("did not report which account", body)
+ 
+-    def test_the_cookie_page_saves_a_verified_session_and_returns_to_the_app(self):
++    def test_the_cookie_page_saves_a_verified_session_and_returns_to_the_cookie_page(self):
+         dash = self._makeApp()
+         client = dash.app.test_client()
+         saved = MagicMock()
+-        with patch.object(dash, "verifyCookiesForEmail", return_value={"sp_dc": "ok"}), \
++        with patch.object(dash, "fetchSpotifyProfile",
++                          return_value={"email": "listening@example.com", "name": None}), \
+              patch.object(dash, "get_user_db", return_value=saved), \
+              patch.object(dash, "is_user_logged_in", return_value=False):
+             response = client.post(
+@@ -274,8 +313,10 @@ class TrustedHeaderRequestTestCase(unittest.TestCase):
+                 environ_base={"REMOTE_ADDR": PROXY_PEER})
+ 
+         self.assertEqual(response.status_code, 302)
+-        self.assertTrue(response.headers["Location"].endswith("/"))
++        self.assertTrue(response.headers["Location"].endswith("/connect-spotify"))
+         self.assertEqual(dash.repo.getUserCookies("myrddin"), {"sp_dc": "ok"})
++        self.assertEqual(dash.repo.getSpotifyIdentity("myrddin")["email"],
++                         "listening@example.com")
+ 
+     def test_a_header_session_survives_a_dead_spotify_listener(self):
+         """Authentication is the proxy's; a dead listener is not a logout.
+-- 
+2.47.3
+

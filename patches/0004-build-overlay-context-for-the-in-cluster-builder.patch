@@ -1,0 +1,204 @@
+From 555e9efb0e84e0d13d857d0955e9b6366dbdb89d Mon Sep 17 00:00:00 2001
+From: homelab <homelab@emrys.dev>
+Date: Fri, 20 Nov 2026 21:15:17 +0000
+Subject: [PATCH 04/10] build: overlay context for the in-cluster builder
+
+The cluster builder delivers its context as a ConfigMap: only top-level files
+are copied and the whole thing is capped near 900 KB. This repository is
+~14 MB with the app in subdirectories, so its own Dockerfile cannot be built
+there.
+
+homelab-image/ pins the upstream 1.55.3 image by digest and copies exactly the
+six files this series changes or adds. make-context.sh stages them flat from
+the checkout and prints their sha256, so the built image is traceable to the
+tree that was tested without a second copy of the source in git.
+
+The README records the base-image check: all 293 files in the upstream image
+are byte-identical to a pristine git archive of tag 1.55.3, so any difference
+in the result comes from the overlay.
+---
+ homelab-image/.gitignore      |  1 +
+ homelab-image/Dockerfile      | 35 +++++++++++++++++
+ homelab-image/README.md       | 72 +++++++++++++++++++++++++++++++++++
+ homelab-image/make-context.sh | 40 +++++++++++++++++++
+ 4 files changed, 148 insertions(+)
+ create mode 100644 homelab-image/.gitignore
+ create mode 100644 homelab-image/Dockerfile
+ create mode 100644 homelab-image/README.md
+ create mode 100755 homelab-image/make-context.sh
+
+diff --git a/homelab-image/.gitignore b/homelab-image/.gitignore
+new file mode 100644
+index 0000000..9d581fb
+--- /dev/null
++++ b/homelab-image/.gitignore
+@@ -0,0 +1 @@
++.context/
+diff --git a/homelab-image/Dockerfile b/homelab-image/Dockerfile
+new file mode 100644
+index 0000000..c51963a
+--- /dev/null
++++ b/homelab-image/Dockerfile
+@@ -0,0 +1,35 @@
++# A patch-overlay image: the upstream release, plus this fork's changed files.
++#
++# WHY NOT build the repository's own Dockerfile: the cluster builder
++# (scripts/build-image.sh) delivers its context as a ConfigMap with two hard
++# properties - only TOP-LEVEL files are copied, and the whole thing is capped
++# at 1 MiB. This repository is ~14 MB across app.py plus routes/, services/,
++# templates/ and Database/, so its own Dockerfile cannot be built there
++# without changing the builder. An overlay is small, reproducible, and states
++# exactly which files differ from upstream.
++#
++# THE BASE IS PINNED BY DIGEST, not by tag, for the same reason the live
++# Deployment is: a repushed tag must not silently change what this fork runs
++# on. The digest below is the multi-arch index for upstream 1.55.3, the
++# version this patch series was written against and the one deployed.
++#
++# THE CONTEXT IS GENERATED. `make-context.sh` copies the changed files out of
++# the checkout into .context/ under flat names (the ConfigMap would drop the
++# subdirectories), with this Dockerfile. Build with:
++#
++#   homelab/scripts/dev/dev-build.sh spotifystatstracker \
++#     --context homelab-image/.context --image spotify-tracker:1.55.3-homelab.1
++#
++# `homelab-image/README.md` records how the base was verified against tag
++# 1.55.3 and how to check the result.
++FROM docker.io/i7gamer/spotify-tracker:1.55.3@sha256:79b40166b07376de7d2646272eaa0e7b9578c5512e59c464f65a544545e12b30
++
++# Each COPY overwrites one file that exists in the base; nothing is added to a
++# path the app does not already read. Flat source names are a builder
++# constraint (see above), not a design choice.
++COPY app.py /app/app.py
++COPY config.py /app/config.py
++COPY auth.py /app/routes/auth.py
++COPY trusted_header_route.py /app/routes/trusted_header.py
++COPY trusted_header_service.py /app/services/trusted_header.py
++COPY connect_spotify.html /app/templates/connect_spotify.html
+diff --git a/homelab-image/README.md b/homelab-image/README.md
+new file mode 100644
+index 0000000..6b14551
+--- /dev/null
++++ b/homelab-image/README.md
+@@ -0,0 +1,72 @@
++# homelab-image: the patch-overlay build
++
++This directory is how the fork is built in-cluster, and it exists because the
++builder cannot take this repository's own Dockerfile.
++
++## Why an overlay
++
++`homelab/scripts/build-image.sh` turns its build context into a ConfigMap with
++`kubectl create configmap --from-file=DIR`. Two consequences are load-bearing:
++
++* **Only top-level files are copied.** Subdirectories are silently skipped.
++  This repository is ~14 MB across `routes/`, `services/`, `templates/`,
++  `Database/` and `static/`, so copying the checkout would build an image
++  missing almost all of the app.
++* **The context is capped at ~900 KB** by the script's own guard (the
++  ConfigMap's 1 MiB limit). Even a tar of the source is larger.
++
++The overlay avoids both: the base is the upstream release image, pinned by
++digest, and the context is six flat files that replace or add exactly the
++files this patch series changed. `make-context.sh` stages them from the
++checkout, so there is no second copy to drift.
++
++## Build
++
++```sh
++# from the checkout root, in the dev environment
++homelab-image/make-context.sh
++~/homelab/scripts/dev/dev-build.sh spotifystatstracker \
++  --context homelab-image/.context \
++  --image registry.emrys.dev/homelab/spotify-tracker:1.55.3-homelab.1
++```
++
++`make-context.sh` prints a sha256 for every source file; the same values are
++written to `patched-files.txt` in the context.
++
++## Why the base digest is trusted
++
++The `FROM` line is pinned to the multi-arch index for upstream **1.55.3** - the
++version the live deployment runs and the version this patch series was written
++against. Before the first patched build, the base image was verified against a
++pristine `git archive 1.55.3` checkout:
++
++```text
++files in the image (excluding __pycache__): 293
++files compared with tag 1.55.3:              293
++files differing:                               0
++files in the image with no tag counterpart:    0
++```
++
++Every file the image ships is byte-identical to the tag; the remaining tag
++files are excluded by the repository's `.dockerignore` (tests, docs, dev
++tooling). So a change in the built image can only come from the overlay.
++
++After a build, the same comparison can be run against the result: all files
++except the six below must be identical to the base, and the six must match
++`patched-files.txt`:
++
++| Context file | Destination in the image | Change |
++| --- | --- | --- |
++| `app.py` | `/app/app.py` | trusted-header init, request path, cookie verification |
++| `config.py` | `/app/config.py` | the two settings and the session key |
++| `auth.py` | `/app/routes/auth.py` | cookie verification delegated to the shared helper |
++| `trusted_header_route.py` | `/app/routes/trusted_header.py` | new: the hook and `/connect-spotify` |
++| `trusted_header_service.py` | `/app/services/trusted_header.py` | new: settings parsing, peer check, identity |
++| `connect_spotify.html` | `/app/templates/connect_spotify.html` | new: the cookie page |
++
++## What the next patch should not assume
++
++This path works because the overlay is small. A change that adds a static
++asset, a migration file or a new package would need either a bigger context or
++a different builder input (a tar/OCI context or a git fetch in the build Job).
++The real fix belongs in `scripts/build-image.sh`, not in a larger overlay.
+diff --git a/homelab-image/make-context.sh b/homelab-image/make-context.sh
+new file mode 100755
+index 0000000..94244c6
+--- /dev/null
++++ b/homelab-image/make-context.sh
+@@ -0,0 +1,40 @@
++#!/usr/bin/env bash
++# Stage the flat build context for homelab-image/Dockerfile.
++#
++# WHY FLAT: scripts/build-image.sh turns the context into a ConfigMap with
++# `kubectl create configmap --from-file=DIR`, which copies only the files at
++# the top level (subdirectories are silently dropped) and caps the whole thing
++# at 1 MiB. The repository is ~14 MB and mostly subdirectories, so the context
++# is a generated directory of renamed files instead of the checkout.
++#
++# THE SOURCE IS THE CHECKOUT. Every copied file is read from this repository,
++# so the image is the working tree that was tested - not a second copy that can
++# drift. The manifest this writes names every file and its sha256; compare it
++# with `sha256sum` in the built image to prove the overlay landed.
++set -euo pipefail
++
++here="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
++root="$(CDPATH= cd -- "$here/.." && pwd)"
++ctx="$here/.context"
++
++rm -rf "$ctx"
++mkdir -p "$ctx"
++
++copy() {  # <source relative to repo root> <flat name in the context>
++  local source="$root/$1" name="$2"
++  [ -f "$source" ] || { echo "make-context: missing $1" >&2; exit 1; }
++  cp "$source" "$ctx/$name"
++  printf '%s  %s\n' "$(sha256sum "$source" | cut -d' ' -f1)" "$1" >> "$ctx/patched-files.txt"
++}
++
++: > "$ctx/patched-files.txt"
++copy app.py app.py
++copy config.py config.py
++copy routes/auth.py auth.py
++copy routes/trusted_header.py trusted_header_route.py
++copy services/trusted_header.py trusted_header_service.py
++copy templates/connect_spotify.html connect_spotify.html
++cp "$here/Dockerfile" "$ctx/Dockerfile"
++
++echo "make-context: staged $ctx"
++cat "$ctx/patched-files.txt"
+-- 
+2.47.3
+

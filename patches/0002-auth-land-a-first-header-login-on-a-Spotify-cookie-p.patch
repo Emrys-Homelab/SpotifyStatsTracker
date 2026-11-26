@@ -1,0 +1,374 @@
+From 0062e03e2d757a12298df21cf6b91f3abf18cb8c Mon Sep 17 00:00:00 2001
+From: homelab <homelab@emrys.dev>
+Date: Fri, 20 Nov 2026 21:14:58 +0000
+Subject: [PATCH 02/10] auth: land a first header login on a Spotify cookie
+ page
+
+Header-only identity is enough to log in, not to track. is_user_logged_in()
+is false while users.cookies_json is NULL, and the per-user listener that
+records plays is built from those cookies - so a first login with no stored
+session would reach a dashboard that can never record anything.
+
+A header-authenticated account with no stored Spotify session is now sent to
+/connect-spotify, which carries the same cookie instructions as the login
+page and saves the pasted session. This is also where an expired session is
+replaced. The ownership rule is unchanged and now lives in one place
+(verifyCookiesForEmail): the Spotify account's email must match the trusted
+email, because the Listener marks a mismatched session as contamination and
+refuses to record it.
+
+get_current_user_or_redirect() also stops treating listener health as
+authentication for a header-established session. Otherwise a Spotify outage
+or a lapsed cookie would redirect to /login, which this mode serves as 404.
+
+Standalone login keeps its exact behaviour: routes/auth.py's _verifiedCookies
+delegates to the same helper it used to inline.
+---
+ app.py                            | 22 ++++++++++
+ routes/auth.py                    | 21 ++++-----
+ routes/trusted_header.py          | 67 +++++++++++++++++++++++++++-
+ templates/connect_spotify.html    | 55 +++++++++++++++++++++++
+ tests/test_trusted_header_auth.py | 72 +++++++++++++++++++++++++++----
+ 5 files changed, 214 insertions(+), 23 deletions(-)
+ create mode 100644 templates/connect_spotify.html
+
+diff --git a/app.py b/app.py
+index ae9ba9a..9dfb139 100644
+--- a/app.py
++++ b/app.py
+@@ -479,6 +479,28 @@ class SpotifyDashboardApp(ViewModelMixin, PaginationMixin, DateRangeMixin, Wrapp
+             except OSError:
+                 pass
+ 
++    def verifyCookiesForEmail(self, cookies: str, email: str):
++        """The parsed cookies, or None when they don't provably belong to `email`.
++
++        One implementation for every door that accepts Spotify cookies: the
++        three standalone forms (login/register/reset-password, through
++        routes/auth.py's _verifiedCookies) and the trusted-header
++        /connect-spotify page. They must ask the same question - the per-user
++        Listener refuses to record a session whose Spotify email differs from
++        the account's email (see spotifyListener._captureIdentityBaseline), so
++        accepting a mismatched session here would store a credential that can
++        never track.
++
++        SKIP_EMAIL_VERIFICATION remains the explicit, instance-wide opt-out of
++        the ownership check (see config.py); it is deliberately unchanged.
++        """
++        parsed = parseCookieString(cookies)
++        if (not self.skipEmailVerification
++                and self.repo.isEmailVerificationEnabled()
++                and not self._verifyCookiesMatchEmail(parsed, email)):
++            return None
++        return parsed
++
+     def unauthenticatedResponse(self, nextPath: str | None = None):
+         """The "no live session" response for a route. An ajax request gets a
+         401 JSON body: a redirect would be followed transparently by fetch(),
+diff --git a/routes/auth.py b/routes/auth.py
+index a59115b..ec1fb5e 100644
+--- a/routes/auth.py
++++ b/routes/auth.py
+@@ -27,7 +27,6 @@ from config import (
+     SPOTIFY_AUTH_TIMEOUT_SECONDS, SPOTIFY_CALLBACK_URL_ENV_VAR,
+ )
+ from dashboard.date_ranges import SETTABLE_INTERVALS
+-from Database.Spotify.cookies import parseCookieString
+ from Database.utils import parseError, truncateForLog
+ from Database.lastfm import LastfmClient
+ from services.email_worker import queue_email_notification
+@@ -134,17 +133,15 @@ def register(app, dashboard):
+         down to a character-identical error string. Three copies of one rule is
+         how one of them drifts.
+ 
+-        Verification runs against a THROWAWAY session file (see
+-        _verifyCookiesMatchEmail), so nothing is persisted for an email until
+-        the cookies are shown to be that account's. None rather than {} for the
+-        rejection: every caller has already refused an empty submission, so the
+-        two can't be confused."""
+-        parsed = parseCookieString(cookies)
+-        if (not dashboard.skipEmailVerification
+-                and dashboard.repo.isEmailVerificationEnabled()
+-                and not dashboard._verifyCookiesMatchEmail(parsed, email)):
+-            return None
+-        return parsed
++        The rule itself lives on the dashboard (verifyCookiesForEmail), because
++        the trusted-header /connect-spotify page is a fourth door that must ask
++        the identical question: the per-user Listener refuses to record a
++        Spotify session whose email differs from the account's. Verification
++        runs against a THROWAWAY session file (see _verifyCookiesMatchEmail), so
++        nothing is persisted for an email until the cookies are shown to be that
++        account's. None rather than {} for the rejection: every caller has
++        already refused an empty submission, so the two can't be confused."""
++        return dashboard.verifyCookiesForEmail(cookies, email)
+ 
+     def _safeNextUrl(nextUrl):
+         """Only allow same-origin relative redirects after login - a `next`
+diff --git a/routes/trusted_header.py b/routes/trusted_header.py
+index 7b39342..c87bb3a 100644
+--- a/routes/trusted_header.py
++++ b/routes/trusted_header.py
+@@ -1,7 +1,7 @@
+ # SPDX-FileCopyrightText: 2026 i7Gamer
+ # SPDX-License-Identifier: AGPL-3.0-or-later
+ 
+-"""The trusted-header request path: authenticate from the proxy's assertion.
++"""The trusted-header request path: authenticate, then ask for Spotify cookies.
+ 
+ Registered only when ``TRUSTED_HEADER_AUTH`` is on (see
+ services/trusted_header.py for the settings and the peer check). What this
+@@ -15,6 +15,13 @@ module adds on top of it:
+ * The app's own doors close. ``/login``, ``/register`` and ``/reset-password``
+   answer 404 rather than a form nobody should use; ``/logout`` becomes a
+   redirect (Authelia owns the real session).
++* A first login lands on ``/connect-spotify``. Header-only identity is enough
++  to log in but NOT to track: ``is_user_logged_in()`` is False while
++  ``users.cookies_json`` is NULL, and the per-user listener that records plays
++  is built from those cookies. The cookie page is where that one remaining
++  credential is supplied, and the ownership check is the same one the
++  standalone forms use - the Spotify account's email must match the trusted
++  email, or the listener would (correctly) refuse to record as contamination.
+ 
+ The refusal branches are deliberately NOT redirects to the login form:
+ an untrusted peer, or a missing identity header, is a misconfiguration or an
+@@ -23,9 +30,10 @@ operator to "just log in" past the thing that is wrong.
+ """
+ import logging
+ 
+-from flask import Response, abort, redirect, request, session, url_for
++from flask import Response, abort, redirect, render_template, request, session, url_for
+ 
+ from config import SESSION_VERSION_KEY, TRUSTED_HEADER_SESSION_KEY
++from routes.auth import COOKIE_OWNERSHIP_ERROR
+ from services.trusted_header import (
+     identityFromHeaders,
+     isTrustedPeer,
+@@ -125,4 +133,59 @@ def register(app, dashboard) -> None:
+                         username, identity.user)
+ 
+         _establishSession(dashboard, identity.email, username)
++
++        # Identity is settled; the Spotify credential may not be. The test is
++        # the app's own notion of a usable session - stored cookies AND a
++        # listener that authenticated with them - not merely a non-NULL
++        # cookies_json column. An expired or rejected session must land on the
++        # cookie page too: get_user_db() re-raises a listener construction
++        # failure, and without this check the dashboard answers 500 instead of
++        # offering the one action that fixes it. /connect-spotify is the page
++        # allowed through without a session; a non-GET is refused rather than
++        # redirected, because a form post followed by a 302 is a silent loss.
++        if (request.endpoint != "connectSpotify"
++                and not dashboard.is_user_logged_in(identity.email)):
++            if request.method in ("GET", "HEAD"):
++                return redirect(url_for("connectSpotify"))
++            return _forbidden("no usable Spotify session is connected to this account")
++
+         return None
++
++    @app.route("/connect-spotify", methods=["GET", "POST"])
++    def connectSpotify():
++        """Supply the one credential the SSO proxy cannot: a Spotify session."""
++        email = session.get("email")
++        if not email or session.get(TRUSTED_HEADER_SESSION_KEY) is not True:
++            abort(403)
++        username = dashboard.get_username_for_email(email)
++        if not username:
++            abort(403)
++
++        error = None
++        if request.method == "POST":
++            cookies = request.form.get("cookies", "").strip()
++            if not cookies:
++                error = "Paste the cookies from your Spotify session."
++            else:
++                parsed = dashboard.verifyCookiesForEmail(cookies, email)
++                if parsed is None:
++                    error = COOKIE_OWNERSHIP_ERROR.format(email=email)
++                else:
++                    dashboard.repo.setUserCookies(username, parsed)
++                    # A user who re-connects after an expiry already has a
++                    # Database (and a dead listener); a first login does not.
++                    # Both paths must leave a listener built from the NEW
++                    # cookies and no stale login-status cache.
++                    dashboard._invalidateLoginCache(email)
++                    if username in dashboard.user_databases:
++                        dashboard._refresh_user_session(username, email)
++                    else:
++                        dashboard.get_user_db(username, email)
++                    return redirect(url_for("dashboard"))
++
++        return render_template(
++            "connect_spotify.html",
++            email=email,
++            error=error,
++            has_cookies=dashboard.repo.getUserCookies(username) is not None,
++        )
+diff --git a/templates/connect_spotify.html b/templates/connect_spotify.html
+new file mode 100644
+index 0000000..ea27afc
+--- /dev/null
++++ b/templates/connect_spotify.html
+@@ -0,0 +1,55 @@
++{#- SPDX-FileCopyrightText: 2026 i7Gamer
++    SPDX-License-Identifier: AGPL-3.0-or-later
++
++    The trusted-header first-login page. It is the destination when the proxy
++    has already proved who the user is but this account has no Spotify session
++    stored yet - see routes/trusted_header.py. Deliberately the public layout:
++    there is no account chrome worth showing before the account has a data
++    source, and it keeps this page one form.
++-#}
++{% extends "layout_public.html" %}
++{% block title %}Connect Spotify - {{ super() }}{% endblock %}
++{% block content %}
++
++<div class="login-panel">
++  <div class="login-card">
++    <h1>Connect Spotify</h1>
++    <p>
++      You are signed in as <strong>{{ email }}</strong> through your identity provider.
++      This app reads your listening history from a Spotify web session, so it needs
++      that one credential before it can track anything.
++    </p>
++
++    {% if has_cookies %}
++      <p>
++        A Spotify session is already stored. Pasting a new one replaces it - use this
++        after the saved session expires or if tracking has stopped.
++      </p>
++    {% endif %}
++
++    {% if error %}
++      <p class="error">{{ error }}</p>
++    {% endif %}
++
++    <form class="login-form" method="post" action="{{ url_for('connectSpotify') }}">
++      <input type="hidden" name="csrf_token" value="{{ csrf_token() }}"/>
++
++      <div class="form-group">
++        <label for="connectCookies">Cookies</label>
++        <textarea id="connectCookies" name="cookies" autofocus required></textarea>
++      </div>
++
++      <button type="submit" class="primary-button">Save Spotify Session</button>
++    </form>
++
++    {% include "_cookie_instructions.html" %}
++
++    <p>
++      The Spotify account's email must match <strong>{{ email }}</strong>. The
++      tracker records under the identity your proxy authenticated, and a session
++      for a different Spotify account is refused rather than mixed into it.
++    </p>
++  </div>
++</div>
++
++{% endblock %}
+diff --git a/tests/test_trusted_header_auth.py b/tests/test_trusted_header_auth.py
+index 3c98a33..723c48c 100644
+--- a/tests/test_trusted_header_auth.py
++++ b/tests/test_trusted_header_auth.py
+@@ -150,18 +150,32 @@ class TrustedHeaderRequestTestCase(unittest.TestCase):
+             path, headers=headers or {}, environ_base={"REMOTE_ADDR": peer},
+             **kwargs)
+ 
+-    def test_first_header_login_creates_the_account(self):
++    def test_first_header_login_creates_the_account_and_redirects_to_cookies(self):
+         dash = self._makeApp()
+-        # A path with no view: the request only has to pass the before_request
+-        # hook for the account to be created, and 404 keeps this test out of a
+-        # dashboard render that would start a real per-user Database.
+-        response = self._get(dash, path="/no-such-page",
+-                             headers={"Remote-User": "myrddin"})
++        with patch.object(dash, "is_user_logged_in", return_value=False):
++            response = self._get(dash, headers={"Remote-User": "myrddin"})
+ 
+-        self.assertEqual(response.status_code, 404)
++        self.assertEqual(response.status_code, 302)
++        self.assertIn("/connect-spotify", response.headers["Location"])
+         self.assertEqual(dash.repo.getUsernameForEmail(
+             f"myrddin@{SYNTHETIC_EMAIL_DOMAIN}"), "myrddin")
+ 
++    def test_a_stored_but_dead_spotify_session_lands_on_the_cookie_page(self):
++        """Not a 500: get_user_db() re-raises a listener construction failure.
++
++        The live bug this covers: a dummy/expired cookie made
++        startRecentlyPlayedListener raise WebSocketError, and the dashboard
++        answered 500 because only the cookies_json column was checked.
++        """
++        dash = self._makeApp()
++        dash.repo.upsertUser("myrddin", f"myrddin@{SYNTHETIC_EMAIL_DOMAIN}")
++        dash.repo.setUserCookies("myrddin", {"sp_dc": "expired"})
++        with patch.object(dash, "is_user_logged_in", return_value=False):
++            response = self._get(dash, headers={"Remote-User": "myrddin"})
++
++        self.assertEqual(response.status_code, 302)
++        self.assertIn("/connect-spotify", response.headers["Location"])
++
+     def test_a_request_without_the_header_is_refused(self):
+         dash = self._makeApp()
+         response = self._get(dash)
+@@ -198,11 +212,13 @@ class TrustedHeaderRequestTestCase(unittest.TestCase):
+ 
+     def test_a_trusted_peer_is_still_trusted_when_xff_names_someone_else(self):
+         dash = self._makeApp(env={"TRUST_PROXY_HEADERS": "1"})
++        # /connect-spotify is the one page that does not require a live Spotify
++        # session, so this exercises the peer check without starting a listener.
+         response = self._get(
+-            dash, path="/no-such-page",
++            dash, path="/connect-spotify",
+             headers={"Remote-User": "myrddin",
+                      "X-Forwarded-For": "203.0.113.9"})
+-        self.assertEqual(response.status_code, 404)
++        self.assertEqual(response.status_code, 200)
+         self.assertEqual(dash.repo.getUsernameForEmail(
+             f"myrddin@{SYNTHETIC_EMAIL_DOMAIN}"), "myrddin")
+ 
+@@ -223,6 +239,44 @@ class TrustedHeaderRequestTestCase(unittest.TestCase):
+         health = self._get(dash, path="/health", peer=OTHER_PEER)
+         self.assertEqual(health.status_code, 200)
+ 
++    def test_the_cookie_page_renders_the_instructions(self):
++        dash = self._makeApp()
++        response = self._get(dash, path="/connect-spotify",
++                             headers={"Remote-User": "myrddin"})
++
++        self.assertEqual(response.status_code, 200)
++        body = response.get_data(as_text=True)
++        self.assertIn("Connect Spotify", body)
++        self.assertIn("How to locate your session data", body)
++
++    def test_the_cookie_page_rejects_cookies_that_are_not_this_accounts(self):
++        dash = self._makeApp()
++        client = dash.app.test_client()
++        with patch.object(dash, "verifyCookiesForEmail", return_value=None):
++            response = client.post(
++                "/connect-spotify", data={"cookies": "sp_dc=someone-else"},
++                headers={"Remote-User": "myrddin"},
++                environ_base={"REMOTE_ADDR": PROXY_PEER})
++
++        self.assertEqual(response.status_code, 200)
++        self.assertIn("Couldn&#39;t verify", response.get_data(as_text=True))
++
++    def test_the_cookie_page_saves_a_verified_session_and_returns_to_the_app(self):
++        dash = self._makeApp()
++        client = dash.app.test_client()
++        saved = MagicMock()
++        with patch.object(dash, "verifyCookiesForEmail", return_value={"sp_dc": "ok"}), \
++             patch.object(dash, "get_user_db", return_value=saved), \
++             patch.object(dash, "is_user_logged_in", return_value=False):
++            response = client.post(
++                "/connect-spotify", data={"cookies": "sp_dc=ok"},
++                headers={"Remote-User": "myrddin"},
++                environ_base={"REMOTE_ADDR": PROXY_PEER})
++
++        self.assertEqual(response.status_code, 302)
++        self.assertTrue(response.headers["Location"].endswith("/"))
++        self.assertEqual(dash.repo.getUserCookies("myrddin"), {"sp_dc": "ok"})
++
+     def test_a_header_session_survives_a_dead_spotify_listener(self):
+         """Authentication is the proxy's; a dead listener is not a logout.
+ 
+-- 
+2.47.3
+

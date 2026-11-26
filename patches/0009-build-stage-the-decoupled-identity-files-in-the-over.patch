@@ -1,0 +1,99 @@
+From c51fddee93d480624a4258ee13c82178a4943b9f Mon Sep 17 00:00:00 2001
+From: homelab-admin <homelab-admin@homelab>
+Date: Sun, 22 Nov 2026 19:20:37 +0000
+Subject: [PATCH 09/10] build: stage the decoupled-identity files in the
+ overlay
+
+The overlay context is flat and explicit, so the new schema, user-query,
+listener, worker, context-processor and template/CSS files must be named in
+make-context.sh and COPYed to their real paths. The context is ~740 KB, still
+under the builder's ~900 KB ConfigMap limit.
+---
+ homelab-image/Dockerfile               | 15 +++++++++++++++
+ homelab-image/README.md                |  6 ++++--
+ homelab-image/make-context.sh          | 11 +++++++++++
+ tests/test_with_conn_classification.py |  6 +++++-
+ 4 files changed, 35 insertions(+), 3 deletions(-)
+
+diff --git a/homelab-image/Dockerfile b/homelab-image/Dockerfile
+index c51963a..4d74dba 100644
+--- a/homelab-image/Dockerfile
++++ b/homelab-image/Dockerfile
+@@ -33,3 +33,18 @@ COPY auth.py /app/routes/auth.py
+ COPY trusted_header_route.py /app/routes/trusted_header.py
+ COPY trusted_header_service.py /app/services/trusted_header.py
+ COPY connect_spotify.html /app/templates/connect_spotify.html
++# The decoupled-identity change touches the schema, the user queries, the
++# listener and the templates/chrome that name the Spotify account. Flat source
++# names are the builder's constraint (see above); the destinations are the
++# paths the app already imports or reads.
++COPY db_schema.py /app/Database/db.py
++COPY users_queries.py /app/Database/queries/users.py
++COPY spotify_formatting.py /app/Database/Spotify/formatting.py
++COPY spotify_listener.py /app/Database/Listeners/spotifyListener.py
++COPY listener_worker.py /app/Database/workers/listener.py
++COPY database.py /app/Database/database.py
++COPY context_processors.py /app/dashboard/context_processors.py
++COPY layout.html /app/templates/layout.html
++COPY profile_base.html /app/templates/_profile_base.html
++COPY tracks.html /app/templates/tracks.html
++COPY style.css /app/static/css/style.css
+diff --git a/homelab-image/README.md b/homelab-image/README.md
+index 6b14551..f32b21a 100644
+--- a/homelab-image/README.md
++++ b/homelab-image/README.md
+@@ -16,8 +16,10 @@ builder cannot take this repository's own Dockerfile.
+   ConfigMap's 1 MiB limit). Even a tar of the source is larger.
+ 
+ The overlay avoids both: the base is the upstream release image, pinned by
+-digest, and the context is six flat files that replace or add exactly the
+-files this patch series changed. `make-context.sh` stages them from the
++digest, and the context is the flat files that replace or add exactly the
++files this patch series changed (six for trusted-header mode; the decoupled
++identity change adds the schema, user-query, listener, worker and template
++files it touches). `make-context.sh` stages them from the
+ checkout, so there is no second copy to drift.
+ 
+ ## Build
+diff --git a/homelab-image/make-context.sh b/homelab-image/make-context.sh
+index 94244c6..e5a8311 100755
+--- a/homelab-image/make-context.sh
++++ b/homelab-image/make-context.sh
+@@ -34,6 +34,17 @@ copy routes/auth.py auth.py
+ copy routes/trusted_header.py trusted_header_route.py
+ copy services/trusted_header.py trusted_header_service.py
+ copy templates/connect_spotify.html connect_spotify.html
++copy Database/db.py db_schema.py
++copy Database/queries/users.py users_queries.py
++copy Database/Spotify/formatting.py spotify_formatting.py
++copy Database/Listeners/spotifyListener.py spotify_listener.py
++copy Database/workers/listener.py listener_worker.py
++copy Database/database.py database.py
++copy dashboard/context_processors.py context_processors.py
++copy templates/layout.html layout.html
++copy templates/_profile_base.html profile_base.html
++copy templates/tracks.html tracks.html
++copy static/css/style.css style.css
+ cp "$here/Dockerfile" "$ctx/Dockerfile"
+ 
+ echo "make-context: staged $ctx"
+diff --git a/tests/test_with_conn_classification.py b/tests/test_with_conn_classification.py
+index 40d17c5..6fde3f5 100644
+--- a/tests/test_with_conn_classification.py
++++ b/tests/test_with_conn_classification.py
+@@ -43,7 +43,11 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
+ #< .claude/worktrees holds a COMPLETE second copy of the tree per agent worktree,
+ #  so a root-anchored walk found every exempt site again under a path the
+ #  allowlist does not name - the .dockerignore trap in a test's clothing.
+-SKIPPED_DIRECTORIES = {".venv", "tests", "__pycache__", ".git", "node_modules", ".claude"}
++#< .context is make-context.sh's GENERATED build context: flat copies of source
++#  files, so walking it finds every guarded block a second time under a path
++#  nobody edits
++SKIPPED_DIRECTORIES = {".venv", "tests", "__pycache__", ".git", "node_modules", ".claude",
++                       ".context"}
+ 
+ READ_KEYWORDS = ("SELECT", "PRAGMA", "WITH", "EXPLAIN")
+ WRITE_KEYWORDS = ("INSERT", "UPDATE", "DELETE", "REPLACE", "CREATE", "ALTER",
+-- 
+2.47.3
+
